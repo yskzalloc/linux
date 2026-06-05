@@ -2233,6 +2233,74 @@ config KCOV_SELFTEST
 	  On test failure, causes the kernel to panic. Recommended to be
 	  enabled, ensuring critical functionality works as intended.
 
+config KCOV_DATAFLOW_ARGS
+	bool "Enable KCOV dataflow: function argument capture"
+	depends on KCOV
+	depends on CC_IS_CLANG
+	depends on $(cc-option,-fsanitize-coverage=trace-args)
+	depends on !RUST || $(rustc-option,-Cllvm-args=-sanitizer-coverage-trace-args)
+	help
+	  Captures function arguments at entry via /sys/kernel/debug/kcov_dataflow.
+	  One record per argument of the function as the compiler lowered it
+	  (its IR arguments): a value is recorded as it is -- a pointer as the
+	  address it holds, its pointee is not read -- and an argument the ABI
+	  passes in memory (byval) as the fields of that object.
+	  Enable per-module with: KCOV_DATAFLOW_file.o := y in the Makefile.
+	  Requires clang with -fsanitize-coverage=trace-args support (and,
+	  with CONFIG_RUST, a rustc whose LLVM has the matching pass).
+
+	  What is recorded does not depend on debug information. With
+	  CONFIG_DEBUG_INFO, the compiler also describes in DWARF which
+	  source parameter each record holds, which offline tools such as
+	  "sancov -symbolize-dataflow" use to name parameters and fields.
+
+config KCOV_DATAFLOW_RET
+	bool "Enable KCOV dataflow: return value capture"
+	depends on KCOV
+	depends on CC_IS_CLANG
+	depends on $(cc-option,-fsanitize-coverage=trace-ret)
+	depends on !RUST || $(rustc-option,-Cllvm-args=-sanitizer-coverage-trace-ret)
+	help
+	  Captures function return values via /sys/kernel/debug/kcov_dataflow.
+	  A returned value is recorded as it is, a pointer as the address it
+	  holds; a struct returned through a caller-provided buffer (sret) is
+	  recorded as the fields of that buffer.
+	  Enable per-module with: KCOV_DATAFLOW_file.o := y in the Makefile.
+	  Requires clang with -fsanitize-coverage=trace-ret support (and,
+	  with CONFIG_RUST, a rustc whose LLVM has the matching pass).
+	  As for KCOV_DATAFLOW_ARGS, debug information is only needed to map
+	  records back to the source.
+
+config KCOV_DATAFLOW_NO_INLINE
+	bool "Disable inlining for dataflow-instrumented files"
+	depends on KCOV_DATAFLOW_ARGS || KCOV_DATAFLOW_RET
+	help
+	  Adds -fno-inline to files that opt into dataflow instrumentation
+	  explicitly, with KCOV_DATAFLOW_file.o := y or KCOV_DATAFLOW := y.
+	  Every function boundary in those files is then preserved, so each
+	  one is traced on its own terms rather than as part of whatever it
+	  was inlined into.
+
+	  This does not extend to CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL, which
+	  would mean building the whole kernel with -fno-inline. That is not a
+	  supported configuration: some code needs the inliner to fold a value
+	  into an inline asm "i" operand and fails to build without it.
+
+	  A function that is inlined is no function of its own any more, and
+	  its arguments are not reported: only the functions that remain after
+	  inlining are. Say Y to see the arguments of small helpers in the
+	  files that opt in; say N for lower overhead and ordinary code
+	  generation.
+
+config KCOV_DATAFLOW_INSTRUMENT_ALL
+	bool "Instrument all kernel code with dataflow coverage"
+	depends on KCOV_DATAFLOW_ARGS || KCOV_DATAFLOW_RET
+	help
+	  Instrument all kernel objects with trace-args/trace-ret
+	  automatically. Individual files or directories can opt out
+	  with KCOV_DATAFLOW_file.o := n or KCOV_DATAFLOW := n.
+	  Warning: significantly increases code size and boot time.
+
 menuconfig RUNTIME_TESTING_MENU
 	bool "Runtime Testing"
 	default y

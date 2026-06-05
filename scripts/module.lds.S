@@ -28,6 +28,14 @@ SECTIONS {
 
 	__patchable_function_entries 0 : { *(__patchable_function_entries) }
 
+	/*
+	 * trace-args/trace-ret observation descriptors, one input section per
+	 * text section they describe. They have to be one output section: the
+	 * loader names a sysfs file after every allocated section, and a second
+	 * __sancov_dataflow fails the load with -EEXIST.
+	 */
+	__sancov_dataflow	0 : { KEEP(*(__sancov_dataflow)) }
+
 	.init.klp_funcs		0 : ALIGN(8) { KEEP(*(.init.klp_funcs)) }
 	.init.klp_objects	0 : ALIGN(8) { KEEP(*(.init.klp_objects)) }
 

@@ -473,6 +473,24 @@
 #endif
 
 /*
+ * __sancov_dataflow holds the observation descriptors the compiler emits for
+ * -fsanitize-coverage=trace-args/trace-ret: one entry per callback call, the
+ * call's address (PC-relative) and what the call reports - which IR argument
+ * or return, which element of it, its value class and size. Nothing in the
+ * kernel reads them; they are kept so that offline tools (sancov
+ * -symbolize-dataflow) can resolve a recorded pc against vmlinux. Without a
+ * rule the section is an orphan, which CONFIG_WERROR turns into a link error.
+ */
+#if defined(CONFIG_KCOV_DATAFLOW_ARGS) || defined(CONFIG_KCOV_DATAFLOW_RET)
+#define SANCOV_DATAFLOW							\
+	__sancov_dataflow : AT(ADDR(__sancov_dataflow) - LOAD_OFFSET) {	\
+		KEEP(*(__sancov_dataflow))				\
+	}
+#else
+#define SANCOV_DATAFLOW
+#endif
+
+/*
  * Read only Data
  */
 #define RO_DATA(align)							\
@@ -550,6 +568,7 @@
 	}								\
 									\
 	KCFI_TRAPS							\
+	SANCOV_DATAFLOW							\
 									\
 	RO_EXCEPTION_TABLE						\
 	NOTES								\

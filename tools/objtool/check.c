@@ -1219,6 +1219,10 @@ static const char *uaccess_safe_builtin[] = {
 	"__tsan_unaligned_write16",
 	/* KCOV */
 	"write_comp_data",
+	/* KCOV dataflow */
+	"kcov_df_trace_cmp",
+	"__sanitizer_cov_trace_args",
+	"__sanitizer_cov_trace_ret",
 	"check_kcov_mode",
 	"__sanitizer_cov_trace_pc",
 	"__sanitizer_cov_trace_const_cmp1",
@@ -4661,6 +4665,7 @@ static int validate_ibt(struct objtool_file *file)
 		    !strcmp(sec->name, "__tracepoints")			||
 		    !strcmp(sec->name, ".return_sites")			||
 		    !strcmp(sec->name, ".call_sites")			||
+		    !strcmp(sec->name, "__sancov_dataflow")		||
 		    !strcmp(sec->name, "__patchable_function_entries"))
 			continue;
 
