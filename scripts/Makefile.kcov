@@ -9,3 +9,15 @@ kcov-rflags-$(CONFIG_KCOV_ENABLE_COMPARISONS)	+= -Cllvm-args=-sanitizer-coverage
 
 export CFLAGS_KCOV := $(kcov-flags-y)
 export RUSTFLAGS_KCOV := $(kcov-rflags-y)
+
+# KCOV dataflow: trace function args and return values
+kcov-dataflow-flags-y := -fsanitize-coverage=trace-args,trace-ret
+kcov-dataflow-flags-$(CONFIG_KCOV_DATAFLOW_NO_INLINE) += -fno-inline
+
+# Rust: only add the trace-args/ret llvm-args (sancov-module pass and level=3
+# are already provided by RUSTFLAGS_KCOV since KCOV_DATAFLOW depends on KCOV).
+kcov-dataflow-rflags-y := -Cllvm-args=-sanitizer-coverage-trace-args
+kcov-dataflow-rflags-y += -Cllvm-args=-sanitizer-coverage-trace-ret
+
+export CFLAGS_KCOV_DATAFLOW := $(kcov-dataflow-flags-y)
+export RUSTFLAGS_KCOV_DATAFLOW := $(kcov-dataflow-rflags-y)
