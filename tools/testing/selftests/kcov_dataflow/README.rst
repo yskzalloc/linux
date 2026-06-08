@@ -32,3 +32,21 @@ trigger-view.py
         python3 trigger-view.py <module_name>
         python3 trigger-view.py <module_name> --raw
         python3 trigger-view.py <module_name> --vmlinux vmlinux
+
+rust_ffi_contract/
+    Demonstrates FFI contract violation detection. A callee returns
+    success but leaves buffer=NULL. kcov_dataflow captures struct
+    fields proving the violation.
+    Per-module opt-in: ``KCOV_DATAFLOW_rust_ffi_contract.o := y``::
+
+        make LLVM=1 CC=clang M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
+        python3 trigger-view.py rust_ffi_contract
+
+rust_ffi_contract/
+    Demonstrates FFI contract violation detection. A callee returns
+    success but leaves buffer=NULL. kcov_dataflow captures struct
+    fields proving the violation.
+    Per-module opt-in: ``KCOV_DATAFLOW_rust_ffi_contract.o := y``::
+
+        make LLVM=1 CC=clang M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
+        python3 trigger-view.py rust_ffi_contract
