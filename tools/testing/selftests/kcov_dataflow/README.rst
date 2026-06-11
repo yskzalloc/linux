@@ -59,3 +59,18 @@ binderfs/
 
         make -C tools/testing/selftests/kcov_dataflow/binderfs
         ./binderfs/binderfs_test
+
+eight_struct_args_c/
+    C module with 1-8 argument functions including struct pointer
+    decomposition. Per-module opt-in: ``KCOV_DATAFLOW_eight_struct_args_c.o := y``::
+
+        make LLVM=1 CC=clang M=tools/testing/selftests/kcov_dataflow/eight_struct_args_c modules
+        python3 trigger-view.py eight_struct_args_c
+
+eight_struct_args_rust/
+    Rust equivalent of eight_struct_args_c. Requires CONFIG_RUST.
+    Per-module opt-in: ``KCOV_DATAFLOW_eight_struct_args_rust.o := y``::
+
+        make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
+            M=tools/testing/selftests/kcov_dataflow/eight_struct_args_rust modules
+        python3 trigger-view.py eight_struct_args_rust
