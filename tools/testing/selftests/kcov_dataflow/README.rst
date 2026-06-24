@@ -50,3 +50,12 @@ rust_ffi_contract/
 
         make LLVM=1 CC=clang M=tools/testing/selftests/kcov_dataflow/rust_ffi_contract modules
         python3 trigger-view.py rust_ffi_contract
+
+binderfs/
+    Exercises the binder driver via binderfs with kcov_dataflow recording
+    active. Verifies that function argument records are captured at binder
+    ioctl boundaries. Requires ``KCOV_DATAFLOW := y`` in drivers/android/Makefile
+    or ``CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL=y``::
+
+        make -C tools/testing/selftests/kcov_dataflow/binderfs
+        ./binderfs/binderfs_test

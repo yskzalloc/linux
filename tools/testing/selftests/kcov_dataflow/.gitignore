@@ -6,3 +6,4 @@ user_ioctl/user_ioctl
 *.mod.c
 Module.symvers
 modules.order
+binderfs/binderfs_test
