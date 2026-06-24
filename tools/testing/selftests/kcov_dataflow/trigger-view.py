@@ -25,6 +25,8 @@ import ctypes
 import ctypes.util
 import argparse
 import fcntl
+import subprocess
+import shutil
 
 # Constants
 DF_TYPE_ENTRY = 0xE
@@ -36,12 +38,17 @@ BUF_SIZE = 1048576  # 1M words = 8MB
 def _IOR(t, nr, size):
     return (2 << 30) | (ord(t) << 8) | nr | (size << 16)
 
+def _IOW(t, nr, size):
+    return (1 << 30) | (ord(t) << 8) | nr | (size << 16)
+
 def _IO(t, nr):
     return (ord(t) << 8) | nr
 
 KCOV_DF_INIT_TRACK = _IOR('d', 1, 8)
 KCOV_DF_ENABLE = _IO('d', 100)
 KCOV_DF_DISABLE = _IO('d', 101)
+KCOV_DF_REMOTE_ENABLE = _IOW('d', 102, 8)  # _IOW with unsigned long handle
+KCOV_DF_REMOTE_DISABLE = _IO('d', 103)
 
 # syscall numbers (x86_64)
 import platform
@@ -74,6 +81,32 @@ def load_kallsyms():
     return syms
 
 
+# Rust symbol demangling via llvm-cxxfilt or rustfilt
+_demangler = None
+
+def _init_demangler():
+    global _demangler
+    for tool in ["llvm-cxxfilt", "rustfilt", "c++filt"]:
+        path = shutil.which(tool)
+        if path:
+            _demangler = path
+            return
+    _demangler = ""
+
+def demangle(name):
+    """Demangle a Rust/C++ symbol name."""
+    global _demangler
+    if _demangler is None:
+        _init_demangler()
+    if not _demangler or not name.startswith("_R"):
+        return name
+    try:
+        r = subprocess.run([_demangler, name], capture_output=True, text=True, timeout=2)
+        return r.stdout.strip() if r.returncode == 0 else name
+    except (OSError, subprocess.TimeoutExpired):
+        return name
+
+
 def load_addr2line_cache(vmlinux=None):
     """Build addr2line resolver using vmlinux or module debug info."""
     import subprocess
@@ -89,17 +122,23 @@ def load_addr2line_cache(vmlinux=None):
     return cache, vmlinux
 
 
-def resolve_line(pc, vmlinux, cache):
+def resolve_line(pc, vmlinux, cache, ko_path=None, mod_text_base=0):
     """Resolve PC to source file:line using addr2line."""
     if pc in cache:
         return cache[pc]
-    if not vmlinux:
+    # Determine which binary to use and the adjusted address
+    if ko_path and mod_text_base and pc >= mod_text_base:
+        binary = ko_path
+        addr = pc - mod_text_base
+    elif vmlinux:
+        binary = vmlinux
+        addr = pc
+    else:
         cache[pc] = ""
         return ""
-    import subprocess
     try:
         r = subprocess.run(
-            ["addr2line", "-e", vmlinux, f"0x{pc:x}"],
+            ["addr2line", "-e", binary, f"0x{addr:x}"],
             capture_output=True, text=True, timeout=2)
         loc = r.stdout.strip()
         if loc and loc != "??:0" and loc != "??:?":
@@ -140,15 +179,28 @@ def get_kernel_meta():
     return meta
 
 
-def print_kernel_meta(meta, position="start"):
+def print_kernel_meta(meta, position="start", ko_path=None):
     """Print kernel metadata header/footer."""
-    print(f"# {'─' * 60}")
-    if position == "start":
+    print(f"# {'=' * 60}")
+    if position == "start" or position == "end":
         print(f"# Kernel: {meta.get('release', 'unknown')}")
         print(f"# Build:  {meta.get('version', 'unknown')[:80]}")
         if meta.get('compiler'):
             print(f"# Compiler: {meta['compiler']}")
-    print(f"# {'─' * 60}")
+        # Read rustc version from .ko .comment section
+        if ko_path:
+            try:
+                r = subprocess.run(
+                    ["readelf", "-p", ".comment", ko_path],
+                    capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    if "rustc" in line:
+                        ver = line.split("]", 1)[-1].strip()
+                        print(f"# Rustc: {ver}")
+                        break
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    print(f"# {'=' * 60}")
 
 
 def symbolize(pc, syms):
@@ -166,7 +218,8 @@ def symbolize(pc, syms):
     if addr > pc:
         return f"0x{pc:x}", ""
     offset = pc - addr
-    display = f"{name}+0x{offset:x}" if offset else name
+    dname = demangle(name)
+    display = f"{dname}+0x{offset:x}" if offset else dname
     return display, f" [{mod}]" if mod else ""
 
 
@@ -266,26 +319,39 @@ def parse_records(buf, total_words):
     return records
 
 
-def print_raw(records, syms, vmlinux=None, cache=None):
+def print_raw(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_base=0):
     """Print records in raw format with source line on left."""
     if cache is None:
         cache = {}
+    # Pre-resolve all locations to find max width
+    locs = []
     for r in records:
+        loc = resolve_line(r["pc"], vmlinux, cache, ko_path, mod_text_base)
+        locs.append(loc)
+    max_w = max((len(l) for l in locs if l), default=0)
+    max_w = max(max_w, 10)  # minimum width
+
+    for i, r in enumerate(records):
         name, mod = symbolize(r["pc"], syms)
         sym = f"{name}{mod}"
         t = "ENTRY" if r["type"] == DF_TYPE_ENTRY else "RET  "
         arg_idx = (r["meta"] >> 56) & 0xFF
         size = (r["meta"] >> 48) & 0xFF
-        loc = resolve_line(r["pc"], vmlinux, cache)
-        left = f"{loc:>20s}" if loc else f"{'':>20s}"
-        print(f"{left} │ [{t}] seq={r['seq']:3d} {sym} "
+        left = f"{locs[i]:>{max_w}s}" if locs[i] else f"{'':>{max_w}s}"
+        print(f"{left}   [{t}] seq={r['seq']:3d} {sym} "
               f"arg[{arg_idx}]({size}) = {format_val(r['val'])}")
 
 
-def print_tree(records, syms, vmlinux=None, cache=None):
+def print_tree(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_base=0):
     """Print records as indented call tree with source line on left."""
     if cache is None:
         cache = {}
+    # Pre-resolve all PCs for alignment
+    for r in records:
+        resolve_line(r["pc"], vmlinux, cache, ko_path, mod_text_base)
+    max_w = max((len(v) for v in cache.values() if v), default=10)
+    max_w = max(max_w, 10)
+
     depth = 0
     call_stack = []  # Stack of (name, mod, args_str, pc) for matching returns
     i = 0
@@ -315,25 +381,25 @@ def print_tree(records, syms, vmlinux=None, cache=None):
                 depth = max(0, depth - 1)
                 indent = "  " * depth
                 vname, vmod, vargs, vpc = call_stack.pop()
-                loc = resolve_line(vpc, vmlinux, cache)
-                left = f"{loc:>20s}" if loc else f"{'':>20s}"
-                print(f"{left} │ {indent}{vname}({vargs}){vmod}")
+                loc = resolve_line(vpc, vmlinux, cache, ko_path, mod_text_base)
+                left = f"{loc:>{max_w}s}" if loc else f"{'':>{max_w}s}"
+                print(f"{left}   {indent}{vname}({vargs}){vmod}")
             depth = max(0, depth - 1)
             indent = "  " * depth
             ret_size = (r["meta"] >> 48) & 0xFF
-            loc = resolve_line(r["pc"], vmlinux, cache)
-            left = f"{loc:>20s}" if loc else f"{'':>20s}"
+            loc = resolve_line(r["pc"], vmlinux, cache, ko_path, mod_text_base)
+            left = f"{loc:>{max_w}s}" if loc else f"{'':>{max_w}s}"
             if call_stack:
                 cname, cmod, cargs, _ = call_stack.pop()
                 if ret_size == 0:
-                    print(f"{left} │ {indent}{cname}({cargs}){cmod}")
+                    print(f"{left}   {indent}{cname}({cargs}){cmod}")
                 else:
-                    print(f"{left} │ {indent}{format_val(r['val'])} = {cname}({cargs}){cmod}")
+                    print(f"{left}   {indent}{format_val(r['val'])} = {cname}({cargs}){cmod}")
             else:
                 if ret_size == 0:
-                    print(f"{left} │ {indent}{name}(){mod}")
+                    print(f"{left}   {indent}{name}(){mod}")
                 else:
-                    print(f"{left} │ {indent}{format_val(r['val'])} = {name}(){mod}")
+                    print(f"{left}   {indent}{format_val(r['val'])} = {name}(){mod}")
             i += 1
 
     # Flush remaining void calls on the stack
@@ -341,9 +407,9 @@ def print_tree(records, syms, vmlinux=None, cache=None):
         depth = max(0, depth - 1)
         indent = "  " * depth
         vname, vmod, vargs, vpc = call_stack.pop()
-        loc = resolve_line(vpc, vmlinux, cache)
-        left = f"{loc:>20s}" if loc else f"{'':>20s}"
-        print(f"{left} │ {indent}{vname}({vargs}){vmod}")
+        loc = resolve_line(vpc, vmlinux, cache, ko_path, mod_text_base)
+        left = f"{loc:>{max_w}s}" if loc else f"{'':>{max_w}s}"
+        print(f"{left}   {indent}{vname}({vargs}){vmod}")
 
 
 def main():
@@ -356,6 +422,8 @@ def main():
     parser.add_argument("--context", "-C", type=int, default=0,
                         help="Show N lines before/after each module record")
     parser.add_argument("--vmlinux", help="Path to vmlinux for addr2line")
+    parser.add_argument("--remote", action="store_true",
+                        help="Use KCOV_DF_REMOTE_ENABLE for kworker capture")
     args = parser.parse_args()
 
     # Find module
@@ -416,7 +484,9 @@ def main():
         pass
 
     # Enable recording AFTER load, BEFORE trigger (avoids VFS/loader noise)
-    fcntl.ioctl(df_fd, KCOV_DF_ENABLE, 0)
+    enable_cmd = KCOV_DF_REMOTE_ENABLE if args.remote else KCOV_DF_ENABLE
+    # For remote: pass handle=1 (must match kernel module's kcov_df_remote_start(1))
+    fcntl.ioctl(df_fd, enable_cmd, 1 if args.remote else 0)
     buf[0] = 0
 
     # Trigger the module's debugfs file to invoke test functions
@@ -425,6 +495,7 @@ def main():
         f"/sys/kernel/debug/kcov_dataflow_test/rust_ffi_trigger",
         f"/sys/kernel/debug/kcov_dataflow_test/trigger_struct",
         f"/sys/kernel/debug/kcov_dataflow_test/trigger_struct_rust",
+        f"/sys/kernel/debug/kcov_dataflow_test/trigger_kworker_remote",
         f"/sys/kernel/debug/trigger_rust",
         f"/sys/kernel/debug/trigger_struct_rust",
         f"/sys/kernel/debug/{mod_name}/trigger",
@@ -448,7 +519,8 @@ def main():
             os.close(fd)
         break
 
-    fcntl.ioctl(df_fd, KCOV_DF_DISABLE, 0)
+    disable_cmd = KCOV_DF_REMOTE_DISABLE if args.remote else KCOV_DF_DISABLE
+    fcntl.ioctl(df_fd, disable_cmd, 0)
 
     # Read kallsyms while module is still loaded (symbols available)
     syms = load_kallsyms()
@@ -507,17 +579,17 @@ def main():
 
     # Kernel metadata
     meta = get_kernel_meta()
-    print_kernel_meta(meta, "start")
+    print_kernel_meta(meta, "start", ko_path=ko_path)
 
     # addr2line setup
     a2l_cache, vmlinux = load_addr2line_cache(args.vmlinux)
 
     if args.raw:
-        print_raw(records, syms, vmlinux, a2l_cache)
+        print_raw(records, syms, vmlinux, a2l_cache, ko_path, mod_text_start)
     else:
-        print_tree(records, syms, vmlinux, a2l_cache)
+        print_tree(records, syms, vmlinux, a2l_cache, ko_path, mod_text_start)
 
-    print_kernel_meta(meta, "end")
+    print_kernel_meta(meta, "end", ko_path=ko_path)
     os.close(df_fd)
 
 

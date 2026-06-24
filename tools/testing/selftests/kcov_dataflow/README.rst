@@ -74,3 +74,14 @@ eight_struct_args_rust/
         make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
             M=tools/testing/selftests/kcov_dataflow/eight_struct_args_rust modules
         python3 trigger-view.py eight_struct_args_rust
+
+rust_kworker_remote/
+    Rust module that tests kcov_df_remote_start/stop from kworker context.
+    Three phases (populate/update/drain) run on system_wq with remote
+    capture active. Requires CONFIG_RUST.
+    Per-module opt-in: ``KCOV_DATAFLOW_rust_kworker_remote.o := y``::
+
+        make LLVM=1 CC=clang RUSTC=$RUSTC RUST_LIB_SRC=$RUST_LIB_SRC \
+            M=tools/testing/selftests/kcov_dataflow/rust_kworker_remote modules
+        python3 trigger-view.py rust_kworker_remote --ko \
+            rust_kworker_remote/rust_kworker_remote.ko --remote
