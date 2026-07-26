@@ -20,4 +20,7 @@ obj-$(CONFIG_SAMPLE_RUST_SOC)			+= rust_soc.o
 
 rust_print-y := rust_print_main.o rust_print_events.o
 
+obj-$(CONFIG_SAMPLE_RUST_HARDEN)		+= harden/
+obj-$(CONFIG_SAMPLE_RUST_HARDEN_REMOTE)		+= harden/
+
 subdir-$(CONFIG_SAMPLE_RUST_HOSTPROGS)		+= hostprogs

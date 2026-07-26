@@ -1,0 +1,18 @@
+# Built fuzzer binaries (userspace, userspace_a, userspace_b, ...)
+userspace
+userspace_*
+u_*
+a.out
+*.o
+
+# libFuzzer artifacts and logs
+crash-*
+leak-*
+timeout-*
+oom-*
+slow-unit-*
+*.log
+
+# Corpus / working dirs
+corpus/
+CORPUS/

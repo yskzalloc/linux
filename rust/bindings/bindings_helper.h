@@ -70,6 +70,7 @@
 #include <linux/iosys-map.h>
 #include <linux/jiffies.h>
 #include <linux/jump_label.h>
+#include <linux/kcov.h>
 #include <linux/mdio.h>
 #include <linux/mm.h>
 #include <linux/miscdevice.h>
@@ -171,3 +172,6 @@ const unsigned long RUST_CONST_HELPER_GPU_BUDDY_TRIM_DISABLE = GPU_BUDDY_TRIM_DI
 #include "../../drivers/android/binder/rust_binder.h"
 #include "../../drivers/android/binder/rust_binder_events.h"
 #endif
+
+/* linux/kcov.h (above) gives samples/rust/harden/remote.rs the KCOV remote FFI:
+ * kcov_remote_start / kcov_remote_stop / kcov_common_handle. */

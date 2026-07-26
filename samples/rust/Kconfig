@@ -190,4 +190,29 @@ config SAMPLE_RUST_HOSTPROGS
 
 	  If unsure, say N.
 
+config SAMPLE_RUST_HARDEN
+	tristate "Hardening demo driver (local KCOV coverage)"
+	depends on KCOV && m
+	help
+	  Build the Rust buggy-on-purpose misc device used by the
+	  "KCOV + libFuzzer + KASAN" hardening tutorial (local coverage).
+	  It co-maps a page with userspace and parses it with a write-side
+	  out-of-bounds bug behind an under-covered branch. Do NOT enable on
+	  a production kernel.
+
+	  If unsure, say N.
+
+config SAMPLE_RUST_HARDEN_REMOTE
+	tristate "Hardening demo driver (remote KCOV coverage)"
+	depends on SAMPLE_RUST_HARDEN
+	default SAMPLE_RUST_HARDEN
+	help
+	  Build the remote-coverage (workqueue + KCOV_REMOTE_ENABLE) Rust
+	  variant. It uses the KCOV remote FFI (kcov_remote_start/stop,
+	  kcov_common_handle), which rust/bindings/bindings_helper.h now exposes
+	  by including <linux/kcov.h>. Defaults to the same value as
+	  SAMPLE_RUST_HARDEN so it is built alongside the local Rust driver.
+
+	  If unsure, say N.
+
 endif # SAMPLES_RUST
