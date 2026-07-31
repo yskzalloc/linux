@@ -199,6 +199,16 @@ static struct smb_direct_transport *alloc_transport(struct smbdirect_socket *sc)
 	KSMBD_TRANS(t)->conn = conn;
 	KSMBD_TRANS(t)->ops = &ksmbd_smb_direct_transport_ops;
 
+	/*
+	 * Route this socket's kcov remote coverage (the smbdirect transport work
+	 * items in fs/smb/smbdirect/, which run on detached kworkers) to the same
+	 * per-connection handle used by the server's receive loop and command
+	 * kworker. conn captured it from kcov_common_handle() in ksmbd_conn_alloc();
+	 * a zero handle (no active kcov collector) makes those remote sections a
+	 * safe no-op.
+	 */
+	smbdirect_socket_set_kcov_handle(sc, ksmbd_conn_get_kcov_handle(conn));
+
 	return t;
 
 conn_alloc_failed:

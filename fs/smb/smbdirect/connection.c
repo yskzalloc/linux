@@ -6,6 +6,7 @@
 
 #include "internal.h"
 #include <linux/folio_queue.h>
+#include <linux/kcov.h>
 
 struct smbdirect_map_sges {
 	struct ib_sge *sge;
@@ -790,7 +791,24 @@ int smbdirect_connection_wait_for_connected(struct smbdirect_socket *sc)
 }
 EXPORT_SYMBOL_GPL(smbdirect_connection_wait_for_connected);
 
+/*
+ * Balanced mainline-kcov wrapper for the smbdirect receive path; routes by the
+ * per-connection sc->kcov_handle. See __smbdirect_accept_negotiate_recv_work()
+ * in accept.c for the rationale.
+ */
+static void __smbdirect_connection_idle_timer_work(struct work_struct *work);
+
 void smbdirect_connection_idle_timer_work(struct work_struct *work)
+{
+	struct smbdirect_socket *sc =
+		container_of(work, struct smbdirect_socket, idle.timer_work.work);
+
+	kcov_remote_start_common(smbdirect_socket_get_kcov_handle(sc));
+	__smbdirect_connection_idle_timer_work(work);
+	kcov_remote_stop();
+}
+
+static void __smbdirect_connection_idle_timer_work(struct work_struct *work)
 {
 	struct smbdirect_socket *sc =
 		container_of(work, struct smbdirect_socket, idle.timer_work.work);
@@ -1451,7 +1469,24 @@ skip_free:
 		wake_up(&sc->send_io.pending.zero_wait_queue);
 }
 
+/*
+ * Balanced mainline-kcov wrapper for the smbdirect receive path; routes by the
+ * per-connection sc->kcov_handle. See __smbdirect_accept_negotiate_recv_work()
+ * in accept.c for the rationale.
+ */
+static void __smbdirect_connection_send_immediate_work(struct work_struct *work);
+
 static void smbdirect_connection_send_immediate_work(struct work_struct *work)
+{
+	struct smbdirect_socket *sc =
+		container_of(work, struct smbdirect_socket, idle.immediate_work);
+
+	kcov_remote_start_common(smbdirect_socket_get_kcov_handle(sc));
+	__smbdirect_connection_send_immediate_work(work);
+	kcov_remote_stop();
+}
+
+static void __smbdirect_connection_send_immediate_work(struct work_struct *work)
 {
 	struct smbdirect_socket *sc =
 		container_of(work, struct smbdirect_socket, idle.immediate_work);
@@ -1779,7 +1814,24 @@ int smbdirect_connection_recv_io_refill(struct smbdirect_socket *sc)
 	return posted;
 }
 
+/*
+ * Balanced mainline-kcov wrapper for the smbdirect receive path; routes by the
+ * per-connection sc->kcov_handle. See __smbdirect_accept_negotiate_recv_work()
+ * in accept.c for the rationale.
+ */
+static void __smbdirect_connection_recv_io_refill_work(struct work_struct *work);
+
 static void smbdirect_connection_recv_io_refill_work(struct work_struct *work)
+{
+	struct smbdirect_socket *sc =
+		container_of(work, struct smbdirect_socket, recv_io.posted.refill_work);
+
+	kcov_remote_start_common(smbdirect_socket_get_kcov_handle(sc));
+	__smbdirect_connection_recv_io_refill_work(work);
+	kcov_remote_stop();
+}
+
+static void __smbdirect_connection_recv_io_refill_work(struct work_struct *work)
 {
 	struct smbdirect_socket *sc =
 		container_of(work, struct smbdirect_socket, recv_io.posted.refill_work);
