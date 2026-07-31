@@ -4,6 +4,7 @@
  */
 
 #include "internal.h"
+#include <linux/kcov.h>
 #include "../common/smb2status.h"
 
 static int smbdirect_connect_setup_connection(struct smbdirect_socket *sc);
@@ -648,7 +649,24 @@ error:
 	smbdirect_socket_schedule_cleanup(sc, -ECONNABORTED);
 }
 
+/*
+ * Balanced mainline-kcov wrapper for the smbdirect receive path; routes by the
+ * per-connection sc->kcov_handle. See __smbdirect_accept_negotiate_recv_work()
+ * in accept.c for the rationale.
+ */
+static void __smbdirect_connect_negotiate_recv_work(struct work_struct *work);
+
 static void smbdirect_connect_negotiate_recv_work(struct work_struct *work)
+{
+	struct smbdirect_socket *sc =
+		container_of(work, struct smbdirect_socket, connect.work);
+
+	kcov_remote_start_common(smbdirect_socket_get_kcov_handle(sc));
+	__smbdirect_connect_negotiate_recv_work(work);
+	kcov_remote_stop();
+}
+
+static void __smbdirect_connect_negotiate_recv_work(struct work_struct *work)
 {
 	struct smbdirect_socket *sc =
 		container_of(work, struct smbdirect_socket, connect.work);

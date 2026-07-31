@@ -198,6 +198,13 @@ smbdirect_socket_get_current_parameters(struct smbdirect_socket *sc)
 }
 EXPORT_SYMBOL_GPL(smbdirect_socket_get_current_parameters);
 
+void smbdirect_socket_set_kcov_handle(struct smbdirect_socket *sc,
+				      struct kcov_common_handle_id kcov_handle)
+{
+	sc->kcov_handle = kcov_handle;
+}
+EXPORT_SYMBOL_GPL(smbdirect_socket_set_kcov_handle);
+
 int smbdirect_socket_set_kernel_settings(struct smbdirect_socket *sc,
 					 enum ib_poll_context poll_ctx,
 					 gfp_t gfp_mask)

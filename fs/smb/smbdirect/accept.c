@@ -7,6 +7,7 @@
 
 #include "internal.h"
 #include <net/sock.h>
+#include <linux/kcov.h>
 #include "../common/smb2status.h"
 
 static int smbdirect_accept_rdma_event_handler(struct rdma_cm_id *id,
@@ -297,7 +298,33 @@ error:
 	smbdirect_socket_schedule_cleanup(sc, -ECONNABORTED);
 }
 
+/*
+ * Bracket this smbdirect receive-path work item with a mainline kcov remote
+ * section so a fuzzer collecting per-connection coverage also sees the RDMA
+ * transport path. These handlers run on kworkers (task context), detached from
+ * the connection's receive loop, so each is its own top-level remote section.
+ *
+ * smbdirect/ is code shared by the cifs client and the ksmbd server and cannot
+ * reach ksmbd's ksmbd_conn, so the routing handle is copied into the socket by
+ * the server in alloc_transport() (via smbdirect_socket_set_kcov_handle()); it
+ * is 0 for the cifs client or a connection with no active kcov collector, which
+ * makes kcov_remote_start_common() a safe no-op. A thin wrapper keeps the remote
+ * section balanced across every early return in the body without threading gotos
+ * through it. The kcov-dataflow (args/ret) remote is layered on here later.
+ */
+static void __smbdirect_accept_negotiate_recv_work(struct work_struct *work);
+
 static void smbdirect_accept_negotiate_recv_work(struct work_struct *work)
+{
+	struct smbdirect_socket *sc =
+		container_of(work, struct smbdirect_socket, connect.work);
+
+	kcov_remote_start_common(smbdirect_socket_get_kcov_handle(sc));
+	__smbdirect_accept_negotiate_recv_work(work);
+	kcov_remote_stop();
+}
+
+static void __smbdirect_accept_negotiate_recv_work(struct work_struct *work)
 {
 	struct smbdirect_socket *sc =
 		container_of(work, struct smbdirect_socket, connect.work);

@@ -73,6 +73,15 @@ int smbdirect_socket_set_kernel_settings(struct smbdirect_socket *sc,
 					 enum ib_poll_context poll_ctx,
 					 gfp_t gfp_mask);
 
+/*
+ * Route this socket's kcov remote coverage. The caller (e.g. ksmbd) passes the
+ * kcov common handle of the owning connection; the smbdirect transport work
+ * items start their remote coverage sections against it. A zero handle is a
+ * safe no-op.
+ */
+void smbdirect_socket_set_kcov_handle(struct smbdirect_socket *sc,
+				      struct kcov_common_handle_id kcov_handle);
+
 #define SMBDIRECT_LOG_ERR		0x0
 #define SMBDIRECT_LOG_INFO		0x1
 

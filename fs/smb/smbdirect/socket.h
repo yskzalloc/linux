@@ -445,7 +445,31 @@ struct smbdirect_socket {
 				 unsigned int cls,
 				 struct va_format *vaf);
 	} logging;
+
+	/*
+	 * kcov remote-coverage routing handle for this socket. On the ksmbd
+	 * server it is copied from the owning ksmbd_conn->kcov_handle in
+	 * alloc_transport(), so a fuzzer collecting per-connection coverage also
+	 * sees the RDMA transport work items (negotiate/idle/refill/immediate),
+	 * which run on kworkers detached from the connection's receive loop.
+	 * 0 (the cifs client, or an unrouted connection) makes the
+	 * kcov_remote_start_common() calls in those work items a safe no-op.
+	 * The type self-erases to a zero-size struct without CONFIG_KCOV.
+	 */
+	struct kcov_common_handle_id kcov_handle;
 };
+
+/*
+ * Internal getter used by the transport work items to route their kcov remote
+ * coverage. The matching setter is the exported
+ * smbdirect_socket_set_kcov_handle() in socket.c, so ksmbd can set the handle
+ * through the opaque public <linux/smbdirect.h> API without seeing this struct.
+ */
+static inline struct kcov_common_handle_id
+smbdirect_socket_get_kcov_handle(struct smbdirect_socket *sc)
+{
+	return sc->kcov_handle;
+}
 
 static void __smbdirect_socket_disabled_work(struct work_struct *work)
 {
