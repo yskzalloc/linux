@@ -85,6 +85,14 @@ static struct tcp_transport *alloc_transport(struct socket *client_sk)
 	conn->inet_addr = inet_sk(client_sk->sk)->inet_daddr;
 	conn->inet_hash = ipv4_addr_hash(inet_sk(client_sk->sk)->inet_daddr);
 #endif
+	/*
+	 * Route kcov remote coverage for this connection to the fuzzer worker that owns
+	 * the local 127.0.0.<n> address the client connected to. inet_rcv_saddr is the
+	 * accepted socket's local address; IPv6 connections are left unrouted (handle 0).
+	 */
+	if (client_sk->sk->sk_family == AF_INET)
+		ksmbd_conn_set_kcov_ip_handle(conn,
+			ntohl(inet_sk(client_sk->sk)->inet_rcv_saddr));
 	down_write(&conn_list_lock);
 	hash_add(conn_list, &conn->hlist, conn->inet_hash);
 	up_write(&conn_list_lock);

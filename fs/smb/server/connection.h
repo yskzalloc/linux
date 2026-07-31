@@ -18,6 +18,7 @@
 #include <linux/unicode.h>
 #include <linux/workqueue.h>
 #include <linux/bitmap.h>
+#include <linux/kcov.h>
 
 #include "smb_common.h"
 #include "ksmbd_work.h"
@@ -151,6 +152,12 @@ struct ksmbd_conn {
 	bool				aapl_readdir_attr; /* READDIR_ATTR negotiated */
 	bool				aapl_readdir_attr_v2; /* V2 specifically */
 	struct work_struct		release_work;
+	/*
+	 * kcov remote-coverage routing handle for this connection, propagated to
+	 * the command kworker (server.c) and the smbdirect transport work items.
+	 * The type self-erases to a zero-size struct without CONFIG_KCOV.
+	 */
+	struct kcov_common_handle_id	kcov_handle;
 };
 
 struct ksmbd_conn_ops {
@@ -317,4 +324,38 @@ static inline void ksmbd_conn_set_releasing(struct ksmbd_conn *conn)
 }
 
 void ksmbd_all_conn_set_status(struct ksmbd_session *sess, u32 status);
+
+static inline void
+ksmbd_conn_set_kcov_handle(struct ksmbd_conn *conn,
+			   struct kcov_common_handle_id kcov_handle)
+{
+	conn->kcov_handle = kcov_handle;
+}
+
+static inline struct kcov_common_handle_id
+ksmbd_conn_get_kcov_handle(struct ksmbd_conn *conn)
+{
+	return conn->kcov_handle;
+}
+
+/*
+ * Route this connection's remote coverage to the fuzzer worker that owns the local
+ * IPv4 address the client connected to (a worker dials 127.0.0.<n>). The low 16 bits
+ * of the host-order address select the worker; the 0x4b44 ("KD") tag keeps the handle
+ * out of the small-integer space other subsystems use. The userspace fuzzer
+ * (libksmbdzzer.c / grain/common.h) mirrors this exact formula and registers the
+ * matching handle, so ksmbd_conn_get_kcov_handle() feeds kcov_remote_start_common().
+ */
+#define KSMBD_KCOV_IP_HANDLE(ipv4_host_order) \
+	(0x4b440000ULL | ((ipv4_host_order) & 0xFFFFULL))
+
+static inline void
+ksmbd_conn_set_kcov_ip_handle(struct ksmbd_conn *conn, u32 ipv4_host_order)
+{
+#ifdef CONFIG_KCOV
+	conn->kcov_handle = (struct kcov_common_handle_id){
+		.val = KSMBD_KCOV_IP_HANDLE(ipv4_host_order) };
+#endif
+}
+
 #endif /* __CONNECTION_H__ */

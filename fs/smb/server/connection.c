@@ -319,6 +319,13 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
 
 	init_rwsem(&conn->session_lock);
 
+	/*
+	 * Capture the kcov common handle of the context creating this connection
+	 * so remote-coverage sections in the receive loop, the command kworker
+	 * and the smbdirect transport work items all route to the same collector.
+	 */
+	ksmbd_conn_set_kcov_handle(conn, kcov_common_handle());
+
 	return conn;
 }
 
@@ -634,6 +641,7 @@ int ksmbd_conn_handler_loop(void *p)
 	max_req = server_conf.max_inflight_req;
 	conn->last_active = jiffies;
 	set_freezable();
+	kcov_remote_start_common(ksmbd_conn_get_kcov_handle(conn));
 	while (ksmbd_conn_alive(conn)) {
 		if (try_to_freeze())
 			continue;
@@ -731,6 +739,7 @@ recheck:
 			break;
 		}
 	}
+	kcov_remote_stop();
 
 	ksmbd_conn_set_releasing(conn);
 	ksmbd_conn_cancel_async_requests(conn);
