@@ -650,9 +650,9 @@ error:
 }
 
 /*
- * Balanced mainline-kcov wrapper for the smbdirect receive path; routes by the
- * per-connection sc->kcov_handle. See __smbdirect_accept_negotiate_recv_work()
- * in accept.c for the rationale.
+ * Balanced kcov + kcov-dataflow remote wrapper for the smbdirect receive path;
+ * both route by the per-connection sc->kcov_handle. See
+ * __smbdirect_accept_negotiate_recv_work() in accept.c for the rationale.
  */
 static void __smbdirect_connect_negotiate_recv_work(struct work_struct *work);
 
@@ -662,7 +662,9 @@ static void smbdirect_connect_negotiate_recv_work(struct work_struct *work)
 		container_of(work, struct smbdirect_socket, connect.work);
 
 	kcov_remote_start_common(smbdirect_socket_get_kcov_handle(sc));
+	kcov_df_remote_start_common(smbdirect_socket_get_kcov_handle(sc));
 	__smbdirect_connect_negotiate_recv_work(work);
+	kcov_df_remote_stop();
 	kcov_remote_stop();
 }
 

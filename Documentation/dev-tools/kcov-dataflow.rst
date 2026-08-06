@@ -5,7 +5,7 @@ KCOV-Dataflow: function argument and return value extraction
 
 KCOV-Dataflow captures function arguments and return values, including
 automatic struct field decomposition, at instrumented kernel function
-boundaries. It provides per-task, lock-free ring buffers accessible via
+boundaries. It provides per-task, lock-free record buffers accessible via
 ``mmap()``, enabling data-flow-aware fuzzing and post-mortem contract
 verification.
 
@@ -41,11 +41,12 @@ To instrument a specific module, add to its Makefile::
 
         KCOV_DATAFLOW_my_module.o := y
 
-For example, to instrument the Android binder driver::
+For example, to instrument the binder driver, naming the objects that are
+actually compiled rather than the composite ``binder.o``::
 
-        # drivers/android/Makefile
-        KCOV_DATAFLOW_binder.o := y
-        KCOV_DATAFLOW_binder_alloc.o := y
+        # drivers/android/binder/Makefile
+        KCOV_DATAFLOW_rust_binder_main.o := y
+        KCOV_DATAFLOW_rust_binderfs.o := y
 
 To instrument an entire directory, set the variable without a filename::
 
@@ -53,8 +54,11 @@ To instrument an entire directory, set the variable without a filename::
         KCOV_DATAFLOW := y
 
 The build system automatically adds the required compiler flags
-(``-fsanitize-coverage=trace-args,trace-ret``). Debug info is provided
-by ``CONFIG_DEBUG_INFO`` which is a Kconfig dependency.
+(``-fsanitize-coverage=trace-args,trace-ret``). Debug info is not optional:
+both Kconfig options ``depend on DEBUG_INFO``, so a kernel that can enable
+the feature can always expand struct fields. They also depend on
+``CC_IS_CLANG`` and on ``cc-option``/``rustc-option`` probes for the two
+flags, which is why an unpatched toolchain does not show them at all.
 
 Data collection
 ---------------
@@ -142,12 +146,17 @@ return value data for a single syscall:
         return 0;
     }
 
-Ring buffer format
-------------------
+Record buffer format
+--------------------
 
 The buffer is an array of ``u64`` words::
 
-        buf[0]: atomic counter -- total words written
+        buf[0]: number of record words written after buf[0]
+
+It is append-only, not circular: records accumulate from ``buf[1]`` upward and
+once one no longer fits it is dropped. A capture that outgrows the buffer
+therefore loses its tail, not its head, so the beginning of an execution is
+always the part that survives. This is the same discipline mainline kcov uses.
 
 Each record occupies 3 + N words:
 
@@ -205,12 +214,25 @@ Safety
 ------
 
 - Callbacks are ``notrace``, ``__no_sanitize_coverage``, ``noinline``
-  to prevent recursion.
+  to prevent recursion, and bit 31 of ``task_struct::kcov_df_seq`` is held as
+  a per-task guard for the duration of a record, so instrumentation reached
+  from inside the collector cannot re-enter it.
 - Only struct expansion reads memory, and it does so with
   ``copy_from_kernel_nofault()`` -- surviving freed, poisoned or unmapped
   memory. A value that arrives in a register cannot fault at all.
-- An ``in_task()`` guard rejects calls from hardirq/softirq/NMI context,
-  preventing reentrant buffer corruption.
+- The write path bails out when ``!in_task() || pagefault_disabled()``. The
+  first half rejects hardirq, softirq and NMI context, preventing reentrant
+  buffer corruption. The second contains self-instrumentation: an instrumented
+  leaf reached from inside a ``copy_from_kernel_nofault()`` region -- the
+  collector's own, or a KASAN stack walk's -- would otherwise issue a callback
+  per load and soft-lock the CPU, and the per-task guard above only covers
+  re-entry nested inside our own callback, not a fresh entry from the
+  unwinder. The cost is that records are also dropped inside unrelated
+  ``pagefault_disable()`` regions.
+- Both callbacks are on objtool's ``uaccess_safe_builtin[]`` list and bracket
+  the collector with ``user_access_save()``/``user_access_restore()``, so a
+  record written from a function with user access enabled neither trips
+  objtool nor leaves SMAP/PAN open across the collector.
 - No ``printk`` or allocation in the data path.
 - When not enabled for a task, overhead is a single boolean check.
 
@@ -286,7 +308,7 @@ Automated tests and visualization tools are in
             eight_struct_args_c --ko \
             tools/testing/selftests/kcov_dataflow/eight_struct_args_c/eight_struct_args_c.ko"
 
-        # Binderfs ioctl capture test (requires CONFIG_ANDROID_BINDER_IPC):
+        # Binderfs ioctl capture test (requires CONFIG_ANDROID_BINDER_IPC_RUST):
         make -C tools/testing/selftests/kcov_dataflow/binderfs
         vng --user root --exec \
           tools/testing/selftests/kcov_dataflow/binderfs/binderfs_test
@@ -299,8 +321,9 @@ Tracing child processes
 KCOV-Dataflow is per-task: after ``fork()``, the child does not inherit
 the enabled state. To trace child processes, re-enable on the inherited
 file descriptor in the child before ``exec()``. The ``mmap``'d buffer is
-shared (``MAP_SHARED``), so both parent and child write to the same ring
-buffer atomically.
+shared (``MAP_SHARED``), so the child's records land in the same mapping the
+parent can read -- but only one task at a time may be associated with a
+descriptor, so the two never write it concurrently (see the note below).
 
 .. code-block:: c
 
@@ -444,8 +467,11 @@ ABI argument mapping
 
     When debug info is absent or stripped, the pass falls back to positional
     indexing which may misattribute arguments in functions with ABI-inserted
-    hidden parameters. The kernel is always built with ``-g``, so this
-    limitation does not apply to kernel use.
+    hidden parameters. In-tree code cannot reach that state, because
+    ``CONFIG_KCOV_DATAFLOW_ARGS``/``_RET`` depend on ``DEBUG_INFO``; it
+    applies only to an out-of-tree object compiled without ``-g``, which
+    additionally loses its field tables and has indirect struct returns
+    dropped.
 
 Struct-by-value in registers
     A small struct passed or returned by value has no address once the ABI
