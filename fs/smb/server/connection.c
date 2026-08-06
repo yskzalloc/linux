@@ -714,6 +714,7 @@ int ksmbd_conn_handler_loop(void *p)
 	conn->last_active = jiffies;
 	set_freezable();
 	kcov_remote_start_common(ksmbd_conn_get_kcov_handle(conn));
+	kcov_df_remote_start_common(ksmbd_conn_get_kcov_handle(conn));
 	while (ksmbd_conn_alive(conn)) {
 		if (try_to_freeze())
 			continue;
@@ -812,6 +813,7 @@ recheck:
 			break;
 		}
 	}
+	kcov_df_remote_stop();
 	kcov_remote_stop();
 
 	ksmbd_conn_set_releasing(conn);
