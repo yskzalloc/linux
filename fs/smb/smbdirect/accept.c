@@ -300,17 +300,20 @@ error:
 
 /*
  * Bracket this smbdirect receive-path work item with a mainline kcov remote
- * section so a fuzzer collecting per-connection coverage also sees the RDMA
- * transport path. These handlers run on kworkers (task context), detached from
- * the connection's receive loop, so each is its own top-level remote section.
+ * section and a kcov-dataflow one, both keyed by the same handle, so a fuzzer
+ * collecting per-connection coverage also sees the RDMA transport path. These
+ * handlers run on kworkers (task context), detached from the connection's
+ * receive loop, so each is its own top-level remote section. The two collectors
+ * keep separate per-task state, so nesting them is safe; the dataflow section is
+ * the inner one and is closed first.
  *
  * smbdirect/ is code shared by the cifs client and the ksmbd server and cannot
  * reach ksmbd's ksmbd_conn, so the routing handle is copied into the socket by
  * the server in alloc_transport() (via smbdirect_socket_set_kcov_handle()); it
  * is 0 for the cifs client or a connection with no active kcov collector, which
- * makes kcov_remote_start_common() a safe no-op. A thin wrapper keeps the remote
- * section balanced across every early return in the body without threading gotos
- * through it. The kcov-dataflow (args/ret) remote is layered on here later.
+ * makes both starts a safe no-op. A thin wrapper keeps the remote sections
+ * balanced across every early return in the body without threading gotos
+ * through it.
  */
 static void __smbdirect_accept_negotiate_recv_work(struct work_struct *work);
 
@@ -320,7 +323,9 @@ static void smbdirect_accept_negotiate_recv_work(struct work_struct *work)
 		container_of(work, struct smbdirect_socket, connect.work);
 
 	kcov_remote_start_common(smbdirect_socket_get_kcov_handle(sc));
+	kcov_df_remote_start_common(smbdirect_socket_get_kcov_handle(sc));
 	__smbdirect_accept_negotiate_recv_work(work);
+	kcov_df_remote_stop();
 	kcov_remote_stop();
 }
 
