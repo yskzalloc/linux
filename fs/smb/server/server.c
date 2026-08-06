@@ -366,9 +366,11 @@ static void handle_ksmbd_work(struct work_struct *wk)
 	atomic64_inc(&conn->stats.request_served);
 
 	kcov_remote_start_common(ksmbd_conn_get_kcov_handle(conn));
+	kcov_df_remote_start_common(ksmbd_conn_get_kcov_handle(conn));
 
 	__handle_ksmbd_work(work, conn);
 
+	kcov_df_remote_stop();
 	kcov_remote_stop();
 
 	ksmbd_conn_try_dequeue_request(work);
