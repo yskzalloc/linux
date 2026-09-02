@@ -166,9 +166,14 @@ Each record occupies 3 + N words:
        bits[23:0] = sequence number
    * - 1
      - pc
-     - Instrumented function address with the KASLR offset removed (same
-       as the PCs mainline kcov records), so it can be symbolized against
-       vmlinux; add the runtime offset back for ``/proc/kallsyms``
+     - Address of the call that produced the record, with the KASLR offset
+       removed (same as the PCs mainline kcov records), so it can be
+       symbolized against vmlinux; add the runtime offset back for
+       ``/proc/kallsyms``. For a function the compiler inlined, this address
+       lies inside the inlined body, so symbolizing it with inline
+       information (``addr2line -i``) names the inlined callee and the chain
+       it was inlined through; ``/proc/kallsyms`` can only name the function
+       the code was merged into
    * - 2
      - addr / cmp_type
      - ENTRY/RET: the address the field values were read from, and 0 when
@@ -455,7 +460,29 @@ Struct-by-value in registers
 
 Optimized builds
     At ``-O2`` and above, LLVM may eliminate ``#dbg_value`` records for
-    arguments that are dead or fully inlined. Such arguments are reported
-    with a header size of 0 and ``0xBADADD85`` in the value word,
-    indicating the argument existed but its value was unavailable at
-    runtime.
+    arguments that are dead. Such arguments are reported with a header size
+    of 0 and ``0xBADADD85`` in the value word, indicating the argument
+    existed but its value was unavailable at runtime.
+
+Inlined callees
+    A function the compiler inlined is still reported, as a frame of its
+    own: its arguments are traced from inside the inlined body, with their
+    own ``arg_idx`` numbering, and the record's ``pc`` points into that
+    body. The values are the ones the callee actually ran with, taken from
+    the optimized code.
+
+    Two cases are not covered. A callee whose code the optimizer removed
+    entirely has no address range left to report from and is not reported;
+    a callee whose own code folded away still is, as long as the code it
+    had inlined remains. Return values are reported for real functions
+    only, because an inlined callee has no return instruction and no debug
+    record describes a return value.
+
+    ``CONFIG_KCOV_DATAFLOW_NO_INLINE`` is therefore not needed to see the
+    arguments of small callees. It remains useful for attributing each
+    record to the function the source wrote, and it applies only to objects
+    that opt in explicitly with ``KCOV_DATAFLOW_<object>.o := y`` or
+    ``KCOV_DATAFLOW := y`` -- never to the whole tree under
+    ``CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL``, because the kernel cannot be
+    built with ``-fno-inline``: some inline asm ``"i"`` operands depend on
+    the inliner folding a value to a constant.

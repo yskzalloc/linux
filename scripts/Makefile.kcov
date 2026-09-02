@@ -17,7 +17,12 @@ export RUSTFLAGS_KCOV := $(kcov-rflags-y)
 # kernel, so a stray per-file KCOV_DATAFLOW_file.o := y is harmless there.
 kcov-dataflow-flags-$(CONFIG_KCOV_DATAFLOW_ARGS) += -fsanitize-coverage=trace-args
 kcov-dataflow-flags-$(CONFIG_KCOV_DATAFLOW_RET) += -fsanitize-coverage=trace-ret
-kcov-dataflow-flags-$(CONFIG_KCOV_DATAFLOW_NO_INLINE) += -fno-inline
+
+# -fno-inline is kept out of CFLAGS_KCOV_DATAFLOW and exported on its own,
+# because scripts/Makefile.lib applies it only where the dataflow opt-in was
+# explicit -- never to the whole tree under
+# CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL. See the comment there.
+kcov-dataflow-noinline-$(CONFIG_KCOV_DATAFLOW_NO_INLINE) += -fno-inline
 
 # Rust: only add the trace-args/ret llvm-args (sancov-module pass and level=3
 # are already provided by RUSTFLAGS_KCOV since KCOV_DATAFLOW depends on KCOV).
@@ -25,4 +30,5 @@ kcov-dataflow-rflags-$(CONFIG_KCOV_DATAFLOW_ARGS) += -Cllvm-args=-sanitizer-cove
 kcov-dataflow-rflags-$(CONFIG_KCOV_DATAFLOW_RET) += -Cllvm-args=-sanitizer-coverage-trace-ret
 
 export CFLAGS_KCOV_DATAFLOW := $(kcov-dataflow-flags-y)
+export CFLAGS_KCOV_DATAFLOW_NO_INLINE := $(kcov-dataflow-noinline-y)
 export RUSTFLAGS_KCOV_DATAFLOW := $(kcov-dataflow-rflags-y)

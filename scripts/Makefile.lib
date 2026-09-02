@@ -102,6 +102,17 @@ _rust_flags += $(if $(patsubst n%,, \
 	$(KCOV_INSTRUMENT_$(target-stem).o)$(KCOV_INSTRUMENT)y),$(if $(patsubst n%,, \
 	$(KCOV_DATAFLOW_$(target-stem).o)$(KCOV_DATAFLOW)$(if $(is-kernel-object),$(CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL))), \
 	$(RUSTFLAGS_KCOV_DATAFLOW)))
+# CONFIG_KCOV_DATAFLOW_NO_INLINE keys off the *explicit* opt-in only, and
+# deliberately ignores CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL: -fno-inline is not a
+# supported way to build the kernel at large. Several places rely on the inliner
+# for correctness rather than for speed, because an inline asm "i" operand has
+# to fold to a constant -- a static key indexed by a value the optimizer can
+# only pin down after inlining, say. Asking for it on the code under study is
+# meaningful; imposing it on every object is a build failure somewhere else.
+_c_flags += $(if $(patsubst n%,, \
+	$(KCOV_INSTRUMENT_$(target-stem).o)$(KCOV_INSTRUMENT)y),$(if $(patsubst n%,, \
+	$(KCOV_DATAFLOW_$(target-stem).o)$(KCOV_DATAFLOW)), \
+	$(CFLAGS_KCOV_DATAFLOW_NO_INLINE)))
 endif
 
 #

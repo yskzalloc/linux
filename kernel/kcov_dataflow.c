@@ -542,11 +542,12 @@ out:
 /*
  * The two compiler-emitted entry points are on objtool's uaccess_safe_builtin[]
  * list, like the __sanitizer_cov_trace_cmp*() callbacks. The trace-args call is
- * planted as early in the function's entry block as the values it reports allow,
- * which is not necessarily the first instruction: a function that opens a user
- * access region and then does an unsafe_get_user() -- an asm goto, hence a block
- * terminator -- can get the callback AFTER the stac, and objtool then reports
- * "call to __sanitizer_cov_trace_args() with UACCESS enabled".
+ * planted as early in the frame it reports as the values it reports allow,
+ * which for a function's own frame is not necessarily the first instruction: a
+ * function that opens a user access region and then does an unsafe_get_user()
+ * -- an asm goto, hence a block terminator -- can get the callback AFTER the
+ * stac, and objtool then reports "call to __sanitizer_cov_trace_args() with
+ * UACCESS enabled".
  *
  * objtool validates a listed function with AC set and rejects any out-of-line
  * call from it, and kcov_df_write() calls copy_from_kernel_nofault() to expand a
@@ -557,20 +558,32 @@ out:
  *
  * @val is the traced value itself, or, when @num_fields is non-zero, the address
  * of the object whose fields @offsets describes. See kcov_df_write().
+ *
+ * Neither callback is told which function it speaks for: the instrumented
+ * location is the return address, as it is for the __sanitizer_cov_trace_cmp*()
+ * callbacks in kcov.c. One byte is taken off it so that the recorded pc lies
+ * within the call instruction rather than on the instruction after it. That
+ * matters beyond tidiness here, because the compiler also reports the arguments
+ * of callees it inlined, each from inside the inlined body: an address one past
+ * the end of such a body belongs to the next frame, and the record would name
+ * the wrong function. This is the same adjustment every unwinder makes before
+ * symbolizing a return address.
  */
+#define KCOV_DF_CALL_SITE(ret_ip)	((ret_ip) - 1)
+
 #ifdef CONFIG_KCOV_DATAFLOW_ARGS
 noinline void notrace __no_sanitize_coverage
-__sanitizer_cov_trace_args(u64 pc, u32 arg_idx, u32 arg_size, u64 val,
+__sanitizer_cov_trace_args(u32 arg_idx, u32 arg_size, u64 val,
 			   u64 *offsets, u32 num_fields);
 
 noinline void notrace __no_sanitize_coverage
-__sanitizer_cov_trace_args(u64 pc, u32 arg_idx, u32 arg_size, u64 val,
+__sanitizer_cov_trace_args(u32 arg_idx, u32 arg_size, u64 val,
 			   u64 *offsets, u32 num_fields)
 {
 	unsigned long ua_flags = user_access_save();
 
-	kcov_df_write(KCOV_DF_TYPE_ENTRY, pc, arg_idx, arg_size, val,
-		      offsets, num_fields);
+	kcov_df_write(KCOV_DF_TYPE_ENTRY, KCOV_DF_CALL_SITE(_RET_IP_), arg_idx,
+		      arg_size, val, offsets, num_fields);
 	user_access_restore(ua_flags);
 }
 EXPORT_SYMBOL(__sanitizer_cov_trace_args);
@@ -578,17 +591,17 @@ EXPORT_SYMBOL(__sanitizer_cov_trace_args);
 
 #ifdef CONFIG_KCOV_DATAFLOW_RET
 noinline void notrace __no_sanitize_coverage
-__sanitizer_cov_trace_ret(u64 pc, u32 ret_size, u64 val,
+__sanitizer_cov_trace_ret(u32 ret_size, u64 val,
 			  u64 *offsets, u32 num_fields);
 
 noinline void notrace __no_sanitize_coverage
-__sanitizer_cov_trace_ret(u64 pc, u32 ret_size, u64 val,
+__sanitizer_cov_trace_ret(u32 ret_size, u64 val,
 			  u64 *offsets, u32 num_fields)
 {
 	unsigned long ua_flags = user_access_save();
 
-	kcov_df_write(KCOV_DF_TYPE_RET, pc, 0, ret_size, val,
-		      offsets, num_fields);
+	kcov_df_write(KCOV_DF_TYPE_RET, KCOV_DF_CALL_SITE(_RET_IP_), 0,
+		      ret_size, val, offsets, num_fields);
 	user_access_restore(ua_flags);
 }
 EXPORT_SYMBOL(__sanitizer_cov_trace_ret);

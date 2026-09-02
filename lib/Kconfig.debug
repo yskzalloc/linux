@@ -2271,10 +2271,21 @@ config KCOV_DATAFLOW_NO_INLINE
 	bool "Disable inlining for dataflow-instrumented files"
 	depends on KCOV_DATAFLOW_ARGS || KCOV_DATAFLOW_RET
 	help
-	  Adds -fno-inline to files instrumented with KCOV_DATAFLOW.
-	  This ensures every function boundary is preserved, giving
-	  complete argument visibility. Disable for lower overhead at the
-	  cost of losing argument records for inlined functions.
+	  Adds -fno-inline to files that opt into dataflow instrumentation
+	  explicitly, with KCOV_DATAFLOW_file.o := y or KCOV_DATAFLOW := y.
+	  Every function boundary in those files is then preserved, so each
+	  one is traced on its own terms rather than as part of whatever it
+	  was inlined into.
+
+	  This does not extend to CONFIG_KCOV_DATAFLOW_INSTRUMENT_ALL, which
+	  would mean building the whole kernel with -fno-inline. That is not a
+	  supported configuration: some code needs the inliner to fold a value
+	  into an inline asm "i" operand and fails to build without it.
+
+	  Arguments of inlined callees are reported either way -- the
+	  instrumentation traces them from inside each inlined body -- so this
+	  is about how the records are attributed, not about whether they
+	  exist. Say N for lower overhead and ordinary code generation.
 
 config KCOV_DATAFLOW_INSTRUMENT_ALL
 	bool "Instrument all kernel code with dataflow coverage"

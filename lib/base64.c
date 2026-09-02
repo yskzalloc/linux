@@ -27,12 +27,17 @@ static const char base64_tables[][65] = {
  * returning -1 if the character is invalid.
  * char 'A'-'Z' maps to 0-25, 'a'-'z' maps to 26-51, '0'-'9' maps to 52-61,
  * ch_62 maps to 62, ch_63 maps to 63, and other characters return -1
+ *
+ * The result is cast to s8 explicitly: clang type-checks every arm of the
+ * conditional, including the ones its constant condition rules out, so the
+ * digit arm is diagnosed by -Wconstant-conversion for the characters just
+ * above '9' even though it is never selected for them.
  */
 #define INIT_1(v, ch_62, ch_63) \
-	[v] = (v) >= 'A' && (v) <= 'Z' ? (v) - 'A' \
+	[v] = (s8)((v) >= 'A' && (v) <= 'Z' ? (v) - 'A' \
 		: (v) >= 'a' && (v) <= 'z' ? (v) - 'a' + 26 \
 		: (v) >= '0' && (v) <= '9' ? (v) - '0' + 52 \
-		: (v) == (ch_62) ? 62 : (v) == (ch_63) ? 63 : -1
+		: (v) == (ch_62) ? 62 : (v) == (ch_63) ? 63 : -1)
 
 /*
  * Recursive macros to generate multiple Base64 reverse mapping table entries.

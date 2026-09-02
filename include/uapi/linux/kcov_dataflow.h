@@ -27,8 +27,15 @@
  *   area[1 + n ..]         records, back to back, each:
  *
  *     [0] header           see KCOV_DF_HDR_* below
- *     [1] pc               instrumented location; KASLR offset removed, like
- *                          the PCs mainline kcov records
+ *     [1] pc               the call that produced the record; KASLR offset
+ *                          removed, like the PCs mainline kcov records. The
+ *                          compiler also reports the arguments of callees it
+ *                          inlined, from inside each inlined body, so this
+ *                          address identifies which of them the record belongs
+ *                          to; resolving it with inline information
+ *                          (addr2line -i) names the inlined callee, while
+ *                          kallsyms can only name the function its code was
+ *                          merged into
  *     [2] ENTRY/RET: the address the field values were read from, and 0 when
  *                    the record carries the value itself (nvals == 1); an
  *                    address the callee received as NULL/ERR_PTR leaves the
