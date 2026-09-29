@@ -1934,8 +1934,19 @@ int ksmbd_reopen_durable_fd(struct ksmbd_work *work, struct ksmbd_file *fp)
 		return -EBADF;
 	}
 
-	list_for_each_entry(smb_lock, &fp->lock_list, flist) {
-		smb_lock->conn = ksmbd_conn_get(conn);
+	/*
+	 * A durable-preserved fp is counted against no connection:
+	 * session_fd_check() cleared fp->conn without touching the old
+	 * connection's counter, and that connection is going away anyway.  The
+	 * new connection adopting the fp has to count it, otherwise the
+	 * eventual close in __put_fd_final() decrements a counter that was
+	 * never incremented.  A negative count then makes ksmbd_conn_alive()
+	 * miss the "this connection has open files" check and reap a connection
+	 * that is holding a reconnected handle once 'deadtime' is configured.
+	 */
+	atomic_inc(&conn->stats.open_files_count);
+
+	list_for_each_entry(smb_lock, &fp->lock_list, flist) {		smb_lock->conn = ksmbd_conn_get(conn);
 		spin_lock(&conn->llist_lock);
 		list_add_tail(&smb_lock->clist, &conn->lock_list);
 		spin_unlock(&conn->llist_lock);
