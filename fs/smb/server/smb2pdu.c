@@ -2845,6 +2845,21 @@ int smb2_tree_connect(struct ksmbd_work *work)
 			status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
 			goto out_err1;
 		}
+
+		/*
+		 * Open the persistent handle journal and replay it before the
+		 * share is usable.  A share cannot honestly claim Continuous
+		 * Availability without it, so a failure here only costs the CA
+		 * capability -- the share still works as an ordinary one.
+		 */
+		if (test_share_config_flag(share,
+					   KSMBD_SHARE_FLAG_CONTINUOUS_AVAILABILITY)) {
+			int ca_ret = ksmbd_ca_share_enable(work, share);
+
+			if (ca_ret)
+				pr_warn("ksmbd: share '%s': continuous availability disabled: %d\n",
+					share->name, ca_ret);
+		}
 	} else
 		goto out_err1;
 
@@ -4334,6 +4349,18 @@ int smb2_open(struct ksmbd_work *work)
 
 			fp = dh_info.fp;
 
+			/*
+			 * Refresh the journal: the handle is live again, its
+			 * volatile id changed, and if the server dies now the
+			 * client is entitled to the full durable timeout to
+			 * come back rather than the remainder of the old one.
+			 */
+			if (fp->is_persistent) {
+				rc = ksmbd_ca_record_reconnect(fp, sess->user);
+				if (rc)
+					goto err_out2;
+			}
+
 			if (ksmbd_override_fsids(work)) {
 				rc = -ENOMEM;
 				goto err_out2;
@@ -5127,6 +5154,27 @@ int smb2_open(struct ksmbd_work *work)
 					      DURABLE_HANDLE_MAX_TIMEOUT);
 			else
 				fp->durable_timeout = 60000;
+		}
+	}
+
+	if (fp->is_persistent) {
+		/*
+		 * Commit the open to the share's journal before telling the
+		 * client it has a persistent handle.  If it cannot be recorded
+		 * it cannot be recovered, and granting it anyway would be a
+		 * promise the server cannot keep.
+		 */
+		fp->ca_store = ksmbd_ca_store_get(share->ca_store);
+		rc = ksmbd_ca_record_open(fp);
+		if (rc) {
+			pr_err("ksmbd: cannot record persistent handle on '%s': %d\n",
+			       share->name, rc);
+			/* Nothing on disk to retire on the way out. */
+			ksmbd_ca_store_put(fp->ca_store);
+			fp->ca_store = NULL;
+			fp->is_persistent = false;
+			rc = -EMFILE;
+			goto err_out;
 		}
 	}
 
