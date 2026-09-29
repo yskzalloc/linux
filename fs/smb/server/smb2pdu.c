@@ -2903,10 +2903,16 @@ int smb2_tree_connect(struct ksmbd_work *work)
 	rsp->StructureSize = cpu_to_le16(16);
 out_err1:
 	/*
-	 * A configured CA share is not continuously available until persistent
-	 * open recovery, ownership fencing, and failover are implemented.
+	 * Advertise Continuous Availability only once the share's persistent
+	 * handle journal is open and its recorded opens have been recovered:
+	 * a client that sees this capability is entitled to expect its
+	 * persistent handles back after the server restarts.
 	 */
-	rsp->Capabilities = 0;
+	if (share && ksmbd_ca_share_ready(share) &&
+	    conn->vals->req_capabilities & SMB2_GLOBAL_CAP_PERSISTENT_HANDLES)
+		rsp->Capabilities = cpu_to_le32(SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY);
+	else
+		rsp->Capabilities = 0;
 	rsp->Reserved = 0;
 	/* default manual caching */
 	rsp->ShareFlags = SMB2_SHAREFLAG_MANUAL_CACHING;
