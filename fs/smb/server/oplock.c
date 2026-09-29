@@ -1790,6 +1790,92 @@ err_out:
 }
 
 /**
+ * ksmbd_oplock_recover() - rebuild a detached oplock/lease for a recovered open
+ * @fp:		persistent open rebuilt from the CA journal
+ * @level:	oplock level the handle was granted
+ * @is_lease:	true when the handle held a lease rather than an oplock
+ * @lctx:	lease state decoded from the journal, NULL for an oplock
+ *
+ * The result is deliberately identical to what session_fd_check() leaves
+ * behind on a disconnect: the opinfo is on the inode's open list and reachable
+ * through fp->f_opinfo, but has no connection or session, and a recovered
+ * lease is not placed in any lease table -- destroy_lease_table() would have
+ * removed it from one anyway when the owning connection died.  The client
+ * re-requests the lease on reconnect (MS-SMB2: the server is not required to
+ * track lease state across a failover), and ksmbd_reopen_durable_fd() rebinds
+ * the opinfo to the new connection.
+ */
+int ksmbd_oplock_recover(struct ksmbd_file *fp, int level, bool is_lease,
+			 struct lease_ctx_info *lctx)
+{
+	struct oplock_info *opinfo;
+
+	opinfo = kzalloc_obj(struct oplock_info, KSMBD_DEFAULT_GFP);
+	if (!opinfo)
+		return -ENOMEM;
+
+	opinfo->sess = NULL;
+	opinfo->conn = NULL;
+	opinfo->level = level;
+	opinfo->op_state = OPLOCK_STATE_NONE;
+	spin_lock_init(&opinfo->state_lock);
+	opinfo->pending_break = 0;
+	opinfo->fid = fp->persistent_id;
+	opinfo->Tid = 0;
+	INIT_LIST_HEAD(&opinfo->op_entry);
+	INIT_LIST_HEAD(&opinfo->lease_entry);
+	init_waitqueue_head(&opinfo->oplock_q);
+	init_waitqueue_head(&opinfo->oplock_brk);
+	atomic_set(&opinfo->refcount, 1);
+	atomic_set(&opinfo->breaking_cnt, 0);
+	opinfo->o_fp = fp;
+
+	if (is_lease && lctx) {
+		struct lease *lease;
+
+		lease = kmalloc_obj(struct lease, KSMBD_DEFAULT_GFP);
+		if (!lease) {
+			kfree(opinfo);
+			return -ENOMEM;
+		}
+
+		memcpy(lease->lease_key, lctx->lease_key, SMB2_LEASE_KEY_SIZE);
+		memcpy(lease->parent_lease_key, lctx->parent_lease_key,
+		       SMB2_LEASE_KEY_SIZE);
+		lease->state = lctx->req_state;
+		lease->new_state = 0;
+		lease->flags = lctx->flags;
+		lease->duration = lctx->duration;
+		lease->is_dir = lctx->is_dir;
+		lease->version = lctx->version;
+		/*
+		 * Keep the journalled epoch: alloc_lease() increments it for a
+		 * freshly granted v2 lease, but this lease was already granted
+		 * and the client must not see it move backwards.
+		 */
+		lease->epoch = le16_to_cpu(lctx->epoch);
+		lease->ci = fp->f_ci;
+		lease->reuse_epoch = false;
+		lease->l_lb = NULL;
+		INIT_LIST_HEAD(&lease->l_entry);
+		INIT_LIST_HEAD(&lease->open_list);
+		spin_lock_init(&lease->lock);
+		atomic_set(&lease->refcount, 1);
+
+		opinfo->is_lease = true;
+		opinfo->o_lease = lease;
+	}
+
+	opinfo_count_inc(fp);
+	opinfo_add(opinfo, fp);
+	if (opinfo->is_lease)
+		lease_add_open(opinfo->o_lease, opinfo);
+	rcu_assign_pointer(fp->f_opinfo, opinfo);
+
+	return 0;
+}
+
+/**
  * smb_break_all_write_oplock() - break batch/exclusive oplock to level2
  * @work:	smb work
  * @fp:		ksmbd file pointer
@@ -2494,7 +2580,16 @@ int smb2_check_durable_oplock(struct ksmbd_conn *conn,
 			goto out;
 		}
 
-		if (opinfo->level != SMB2_OPLOCK_LEVEL_BATCH) {
+		/*
+		 * A persistent handle is preserved regardless of its oplock
+		 * level (see is_reconnectable()), because on a Continuously
+		 * Available share the write-through and the fencing of
+		 * disconnected handles provide the guarantee instead.  Requiring
+		 * a batch oplock here would refuse to reconnect a handle the
+		 * server was happy to grant and to keep.
+		 */
+		if (!fp->is_persistent &&
+		    opinfo->level != SMB2_OPLOCK_LEVEL_BATCH) {
 			pr_err("oplock level is not equal to SMB2_OPLOCK_LEVEL_BATCH\n");
 			ret = -EBADF;
 		}

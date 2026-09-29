@@ -32,8 +32,52 @@
 #define KSMBD_NO_FID		(INT_MAX)
 #define SMB2_NO_FID		(0xFFFFFFFFFFFFFFFFULL)
 
+/*
+ * Persistent ids for handles on a Continuously Available share are drawn from
+ * a reserved high range.  A persistent id is the only key a DH2C/DHnC
+ * reconnect carries, so recovery after a restart has to reinstate the exact
+ * id from the journal; partitioning the id space keeps that reservation from
+ * ever colliding with an id the cyclic allocator handed out meanwhile.
+ */
+#define KSMBD_CA_FID_BASE	0x40000000
+
+struct ksmbd_ca_store;
 struct ksmbd_conn;
 struct ksmbd_session;
+struct lease_ctx_info;
+
+/*
+ * State needed to rebuild a disconnected persistent open after a server
+ * restart.  Filled in from the on-disk CA record (see ca_store.c) so that
+ * vfs_cache.c does not have to know the on-disk layout.
+ */
+struct ksmbd_durable_recovery {
+	u64			persistent_id;
+	u64			volatile_id;
+	__le32			daccess;
+	__le32			saccess;
+	__le32			coption;
+	__le32			cdoption;
+	__le32			create_file_attributes;
+	__le32			create_action;
+	__u64			create_time;
+	__u64			change_time;
+	__u64			itime;
+	__u64			allocation_size;
+	unsigned int		durable_timeout;
+	/* Milliseconds left on the durable timeout, from the on-disk deadline. */
+	unsigned int		remaining_ms;
+	char			create_guid[16];
+	char			client_guid[16];
+	char			app_instance_id[16];
+	unsigned int		uid;
+	unsigned int		gid;
+	const char		*owner_name;
+	bool			replay_consumed;
+	int			oplock_level;
+	bool			is_lease;
+	struct lease_ctx_info	*lctx;
+};
 
 struct ksmbd_lock {
 	struct file_lock *fl;
@@ -158,6 +202,13 @@ struct ksmbd_file {
 
 	bool                            is_posix_ctxt;
 	struct durable_owner		owner;
+	/*
+	 * Journal this persistent open is recorded in.  Holds a reference, so
+	 * the journal outlives the tree connect (and the share config) that
+	 * created the handle -- which is the whole point of a persistent
+	 * handle.  NULL for every non-persistent open.
+	 */
+	struct ksmbd_ca_store		*ca_store;
 	__le16				channel_sequence;
 	unsigned int			outstanding_requests;
 	unsigned int			outstanding_pre_requests;
@@ -219,8 +270,11 @@ struct ksmbd_file *ksmbd_lookup_fd_cguid(char *cguid);
 struct ksmbd_file *ksmbd_lookup_fd_inode(struct dentry *dentry);
 bool ksmbd_has_other_nonposix_open(struct dentry *dentry);
 bool ksmbd_has_nonposix_open_child(struct ksmbd_file *old_fp);
-unsigned int ksmbd_open_durable_fd(struct ksmbd_file *fp);
+unsigned int ksmbd_open_durable_fd(struct ksmbd_file *fp, bool persistent);
 struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp);
+struct ksmbd_file *
+ksmbd_recover_durable_fd(struct file *filp, struct ksmbd_ca_store *cas,
+			 const struct ksmbd_durable_recovery *r);
 void ksmbd_launch_ksmbd_durable_scavenger(void);
 void ksmbd_stop_durable_scavenger(void);
 bool ksmbd_durable_scavenger_active(void);

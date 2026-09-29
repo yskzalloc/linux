@@ -12,6 +12,7 @@
 #include <linux/unicode.h>
 
 struct ksmbd_work;
+struct ksmbd_ca_store;
 
 struct ksmbd_share_config {
 	char			*name;
@@ -22,6 +23,14 @@ struct ksmbd_share_config {
 	struct list_head	veto_list;
 
 	struct path		vfs_path;
+
+	/*
+	 * Journal of persistent handles on this share, non-NULL once the
+	 * Continuously Available state store has been opened and recovered.
+	 * The share only advertises SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY
+	 * while this is set.
+	 */
+	struct ksmbd_ca_store	*ca_store;
 
 	atomic_t		refcount;
 #ifdef CONFIG_PROC_FS

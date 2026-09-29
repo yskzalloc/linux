@@ -21,6 +21,7 @@
 
 #include "glob.h"
 #include "../common/smbfsctl.h"
+#include "ca_store.h"
 #include "oplock.h"
 #include "smbacl.h"
 
@@ -3678,6 +3679,14 @@ struct durable_info {
 	struct ksmbd_file *fp;
 	unsigned short int type;
 	bool persistent;
+	/*
+	 * The request asked for a persistent handle and the share can give it
+	 * one: Continuous Availability is operational and the connection
+	 * negotiated SMB2_GLOBAL_CAP_PERSISTENT_HANDLES.  Decided once here
+	 * because it both relaxes the oplock requirement below and selects the
+	 * reserved persistent id range in smb2_open().
+	 */
+	bool ca_persistent;
 	bool reconnected;
 	bool replay;
 	bool replay_consumed;
@@ -3999,7 +4008,22 @@ static int parse_durable_handle_context(struct ksmbd_work *work,
 				dh_info->fp = NULL;
 			}
 
-			if ((lc && (lc->req_state & SMB2_LEASE_HANDLE_CACHING_LE)) ||
+			/*
+			 * MS-SMB2 3.3.5.9.10: the batch-oplock or
+			 * handle-caching-lease requirement guards a *durable*
+			 * request.  A persistent request on a Continuously
+			 * Available share carries no such condition -- the
+			 * share's write-through and the fencing of
+			 * disconnected handles stand in for the oplock -- so
+			 * honour it at any oplock level, including none.
+			 */
+			dh_info->ca_persistent = dh_info->persistent &&
+				ksmbd_ca_share_ready(work->tcon->share_conf) &&
+				(work->conn->vals->req_capabilities &
+				 SMB2_GLOBAL_CAP_PERSISTENT_HANDLES);
+
+			if (dh_info->ca_persistent ||
+			    (lc && (lc->req_state & SMB2_LEASE_HANDLE_CACHING_LE)) ||
 			    req_op_level == SMB2_OPLOCK_LEVEL_BATCH) {
 				dh_info->timeout =
 					le32_to_cpu(durable_v2_blob->dcontext.Timeout);
@@ -4146,6 +4170,7 @@ int smb2_open(struct ksmbd_work *work)
 	bool maximal_access_ctxt = false, posix_ctxt = false;
 	bool aapl_ctxt = false;
 	bool durable_rsp = true;
+	bool ca_persistent = false;
 	__u64 aapl_req_bitmap = 0, aapl_client_caps = 0;
 	int s_type = 0;
 	int next_off = 0;
@@ -4270,6 +4295,17 @@ int smb2_open(struct ksmbd_work *work)
 			ksmbd_debug(SMB, "error parsing durable handle context\n");
 			goto err_out2;
 		}
+
+		/*
+		 * parse_durable_handle_context() has already decided whether
+		 * this CREATE can have a persistent handle.  Take that decision
+		 * rather than recomputing it: the answer picks the persistent id
+		 * range (see ksmbd_open_durable_fd()), and the id is handed to
+		 * the oplock layer and to the client long before
+		 * fp->is_persistent is set.
+		 */
+		ca_persistent = dh_info.type == DURABLE_REQ_V2 &&
+				dh_info.ca_persistent && !stream_name;
 
 		if (dh_info.replay == true) {
 			fp = dh_info.fp;
@@ -4720,7 +4756,7 @@ int smb2_open(struct ksmbd_work *work)
 	}
 
 	/* Get Persistent-ID */
-	ksmbd_open_durable_fd(fp);
+	ksmbd_open_durable_fd(fp, ca_persistent);
 	if (!has_file_id(fp->persistent_id)) {
 		rc = -ENOMEM;
 		goto err_out;
@@ -5073,11 +5109,7 @@ int smb2_open(struct ksmbd_work *work)
 	fp->create_action = cpu_to_le32(file_info);
 
 	if (dh_info.type == DURABLE_REQ_V2 || dh_info.type == DURABLE_REQ) {
-		if (dh_info.type == DURABLE_REQ_V2 && dh_info.persistent &&
-		    test_share_config_flag(work->tcon->share_conf,
-					   KSMBD_SHARE_FLAG_CONTINUOUS_AVAILABILITY) &&
-		    (conn->vals->req_capabilities &
-			     SMB2_GLOBAL_CAP_PERSISTENT_HANDLES)) {
+		if (ca_persistent) {
 			/* MS-SMB2 3.3.5.9.10: a persistent open is durable too. */
 			fp->is_durable = true;
 			fp->is_persistent = true;

@@ -16,6 +16,7 @@
 #include "share_config.h"
 #include "user_config.h"
 #include "user_session.h"
+#include "../ca_store.h"
 #include "../connection.h"
 #include "../transport_ipc.h"
 #include "../misc.h"
@@ -93,6 +94,8 @@ static unsigned int share_name_hash(const char *name)
 
 static void kill_share(struct ksmbd_share_config *share)
 {
+	ksmbd_ca_share_release(share);
+
 	while (!list_empty(&share->veto_list)) {
 		struct ksmbd_veto_pattern *p;
 
@@ -144,6 +147,25 @@ static struct ksmbd_share_config *__share_lookup(const char *name)
 	return NULL;
 }
 
+static int add_veto_pattern(struct ksmbd_share_config *share,
+			    const char *pattern, size_t len)
+{
+	struct ksmbd_veto_pattern *p;
+
+	p = kzalloc_obj(struct ksmbd_veto_pattern, KSMBD_DEFAULT_GFP);
+	if (!p)
+		return -ENOMEM;
+
+	p->pattern = kstrndup(pattern, len, KSMBD_DEFAULT_GFP);
+	if (!p->pattern) {
+		kfree(p);
+		return -ENOMEM;
+	}
+
+	list_add(&p->list, &share->veto_list);
+	return 0;
+}
+
 static int parse_veto_list(struct ksmbd_share_config *share,
 			   char *veto_list,
 			   size_t veto_list_sz)
@@ -154,23 +176,15 @@ static int parse_veto_list(struct ksmbd_share_config *share,
 		return 0;
 
 	while (veto_list_sz > 0) {
-		struct ksmbd_veto_pattern *p;
+		int ret;
 
 		sz = strnlen(veto_list, veto_list_sz);
 		if (!sz)
 			break;
 
-		p = kzalloc_obj(struct ksmbd_veto_pattern, KSMBD_DEFAULT_GFP);
-		if (!p)
-			return -ENOMEM;
-
-		p->pattern = kstrndup(veto_list, sz, KSMBD_DEFAULT_GFP);
-		if (!p->pattern) {
-			kfree(p);
-			return -ENOMEM;
-		}
-
-		list_add(&p->list, &share->veto_list);
+		ret = add_veto_pattern(share, veto_list, sz);
+		if (ret)
+			return ret;
 
 		if (sz == veto_list_sz)
 			break;
@@ -264,6 +278,15 @@ static struct ksmbd_share_config *share_config_request(struct ksmbd_work *work,
 			ret = parse_veto_list(share,
 					      KSMBD_SHARE_CONFIG_VETO_LIST(resp),
 					      resp->veto_list_sz);
+		/*
+		 * The CA state directory lives inside the share, so veto it:
+		 * clients must not be able to enumerate, read, rename or
+		 * delete the journal that backs their own persistent handles.
+		 */
+		if (!ret &&
+		    test_share_config_flag(share,
+					   KSMBD_SHARE_FLAG_CONTINUOUS_AVAILABILITY))
+			ret = ksmbd_ca_veto_patterns(share, add_veto_pattern);
 		if (!ret && share->path) {
 			if (__ksmbd_override_fsids(work, share)) {
 				kill_share(share);

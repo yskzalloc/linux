@@ -14,6 +14,7 @@
 
 #include "glob.h"
 #include "vfs_cache.h"
+#include "ca_store.h"
 #include "oplock.h"
 #include "vfs.h"
 #include "connection.h"
@@ -619,6 +620,15 @@ static void __ksmbd_close_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp)
 	struct ksmbd_lock *smb_lock, *tmp_lock;
 	struct ksmbd_work *cn_work;
 
+	/*
+	 * Retire the on-disk record first: ksmbd_remove_durable_fd() below
+	 * clears fp->persistent_id, and the tombstone has to name the handle
+	 * it retires.  Getting this order wrong leaves the record live, so a
+	 * restart resurrects a handle the client has already closed and fences
+	 * everyone else off the file until its durable timeout expires.
+	 */
+	ksmbd_ca_record_close(fp);
+
 	fd_limit_close();
 	ksmbd_remove_durable_fd(fp);
 	if (ft)
@@ -1208,12 +1218,13 @@ bool ksmbd_has_nonposix_open_child(struct ksmbd_file *old_fp)
 
 #define OPEN_ID_TYPE_VOLATILE_ID	(0)
 #define OPEN_ID_TYPE_PERSISTENT_ID	(1)
+#define OPEN_ID_TYPE_CA_PERSISTENT_ID	(2)
 
 static void __open_id_set(struct ksmbd_file *fp, u64 id, int type)
 {
 	if (type == OPEN_ID_TYPE_VOLATILE_ID)
 		fp->volatile_id = id;
-	if (type == OPEN_ID_TYPE_PERSISTENT_ID)
+	else
 		fp->persistent_id = id;
 }
 
@@ -1221,6 +1232,7 @@ static int __open_id(struct ksmbd_file_table *ft, struct ksmbd_file *fp,
 		     int type)
 {
 	u64			id = 0;
+	int			start, end;
 	int			ret;
 
 	if (type == OPEN_ID_TYPE_VOLATILE_ID && fd_limit_depleted()) {
@@ -1228,10 +1240,20 @@ static int __open_id(struct ksmbd_file_table *ft, struct ksmbd_file *fp,
 		return -EMFILE;
 	}
 
+	if (type == OPEN_ID_TYPE_CA_PERSISTENT_ID) {
+		start = KSMBD_CA_FID_BASE;
+		end = INT_MAX - 1;
+	} else if (type == OPEN_ID_TYPE_PERSISTENT_ID) {
+		start = KSMBD_START_FID;
+		end = KSMBD_CA_FID_BASE;
+	} else {
+		start = KSMBD_START_FID;
+		end = INT_MAX - 1;
+	}
+
 	idr_preload(KSMBD_DEFAULT_GFP);
 	write_lock(&ft->lock);
-	ret = idr_alloc_cyclic(ft->idr, fp, KSMBD_START_FID, INT_MAX - 1,
-			       GFP_NOWAIT);
+	ret = idr_alloc_cyclic(ft->idr, fp, start, end, GFP_NOWAIT);
 	if (ret >= 0) {
 		id = ret;
 		ret = 0;
@@ -1246,9 +1268,22 @@ static int __open_id(struct ksmbd_file_table *ft, struct ksmbd_file *fp,
 	return ret;
 }
 
-unsigned int ksmbd_open_durable_fd(struct ksmbd_file *fp)
+/**
+ * ksmbd_open_durable_fd() - allocate the persistent id of an open
+ * @fp:		the open
+ * @persistent: true when this open is being granted as an SMB3 persistent
+ *		handle on a Continuously Available share
+ *
+ * Persistent handles get their id from the reserved CA range so that CA
+ * recovery can reinstate the exact ids recorded in the on-disk journal.  The
+ * decision has to be made here rather than when fp->is_persistent is set,
+ * because the id is already published to the oplock layer (as opinfo->fid)
+ * and to the client in the CREATE response.
+ */
+unsigned int ksmbd_open_durable_fd(struct ksmbd_file *fp, bool persistent)
 {
-	__open_id(&global_ft, fp, OPEN_ID_TYPE_PERSISTENT_ID);
+	__open_id(&global_ft, fp, persistent ? OPEN_ID_TYPE_CA_PERSISTENT_ID :
+					       OPEN_ID_TYPE_PERSISTENT_ID);
 	return fp->persistent_id;
 }
 
@@ -1303,6 +1338,168 @@ struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp)
 err_out:
 	/* fp->conn was set and refcounted before every branch here. */
 	ksmbd_conn_put(fp->conn);
+	kmem_cache_free(filp_cache, fp);
+	return ERR_PTR(ret);
+}
+
+/*
+ * Reserve one exact persistent id.  Only ids from the reserved CA range are
+ * accepted, which is what makes the reservation collision-free against the
+ * cyclic allocator (see the comment on KSMBD_CA_FID_BASE).
+ */
+static int __open_id_exact(struct ksmbd_file *fp, u64 id)
+{
+	int ret;
+
+	if (id < KSMBD_CA_FID_BASE || id >= INT_MAX - 1)
+		return -EINVAL;
+
+	idr_preload(KSMBD_DEFAULT_GFP);
+	write_lock(&global_ft.lock);
+	ret = idr_alloc(global_ft.idr, fp, id, id + 1, GFP_NOWAIT);
+	write_unlock(&global_ft.lock);
+	idr_preload_end();
+	if (ret < 0)
+		return ret;
+
+	fp->persistent_id = id;
+	return 0;
+}
+
+/**
+ * ksmbd_recover_durable_fd() - rebuild a disconnected persistent open
+ * @filp:	file re-opened from the path recorded in the CA journal
+ * @cas:	journal the open is recorded in; a reference is taken
+ * @r:		state decoded from the on-disk record
+ *
+ * Produces the exact state session_fd_check() would have left behind had the
+ * server merely lost the connection: published in the global (persistent) file
+ * table under its original id, linked on the inode's open list, carrying its
+ * oplock or lease in detached form, with no connection and no volatile id.  A
+ * DH2C reconnect then resumes it through the existing
+ * smb2_check_durable_oplock() / ksmbd_reopen_durable_fd() path, with no
+ * knowledge that a restart happened in between.
+ *
+ * Return: the open on success, ERR_PTR on failure.  @filp is left to the
+ * caller on failure.
+ */
+struct ksmbd_file *
+ksmbd_recover_durable_fd(struct file *filp, struct ksmbd_ca_store *cas,
+			 const struct ksmbd_durable_recovery *r)
+{
+	struct ksmbd_file *fp;
+	int ret;
+
+	fp = kmem_cache_zalloc(filp_cache, KSMBD_DEFAULT_GFP);
+	if (!fp)
+		return ERR_PTR(-ENOMEM);
+
+	/*
+	 * A recovered open occupies a file slot for as long as it lives, just
+	 * like the durable-preserved open it stands in for; __ksmbd_close_fd()
+	 * gives the slot back.
+	 */
+	if (fd_limit_depleted()) {
+		kmem_cache_free(filp_cache, fp);
+		return ERR_PTR(-EMFILE);
+	}
+
+	INIT_LIST_HEAD(&fp->blocked_works);
+	INIT_LIST_HEAD(&fp->node);
+	INIT_LIST_HEAD(&fp->lock_list);
+	INIT_LIST_HEAD(&fp->notify_pendings);
+	spin_lock_init(&fp->f_lock);
+	mutex_init(&fp->readdir_lock);
+	atomic_set(&fp->refcount, 1);
+
+	fp->filp		= filp;
+	fp->conn		= NULL;
+	fp->tcon		= NULL;
+	fp->volatile_id		= KSMBD_NO_FID;
+	fp->persistent_id	= KSMBD_NO_FID;
+	fp->durable_volatile_id	= r->volatile_id;
+	fp->f_state		= FP_NEW;
+
+	fp->daccess		= r->daccess;
+	fp->saccess		= r->saccess;
+	fp->coption		= r->coption;
+	fp->cdoption		= r->cdoption;
+	fp->create_file_attributes = r->create_file_attributes;
+	fp->create_action	= r->create_action;
+	fp->create_time		= r->create_time;
+	fp->change_time		= r->change_time;
+	fp->itime		= r->itime;
+	fp->allocation_size	= r->allocation_size;
+	fp->is_durable		= true;
+	fp->is_persistent	= true;
+	fp->durable_timeout	= r->durable_timeout;
+	fp->durable_replay_consumed = r->replay_consumed;
+	memcpy(fp->create_guid, r->create_guid, sizeof(fp->create_guid));
+	memcpy(fp->client_guid, r->client_guid, sizeof(fp->client_guid));
+	memcpy(fp->app_instance_id, r->app_instance_id,
+	       sizeof(fp->app_instance_id));
+	if (!mem_is_zero(r->app_instance_id, sizeof(r->app_instance_id)))
+		fp->has_app_instance_id = true;
+
+	fp->owner.uid = r->uid;
+	fp->owner.gid = r->gid;
+	if (r->owner_name) {
+		fp->owner.name = kstrdup(r->owner_name, KSMBD_DEFAULT_GFP);
+		if (!fp->owner.name) {
+			ret = -ENOMEM;
+			goto err_free;
+		}
+	}
+
+	fp->f_ci = ksmbd_inode_get(fp);
+	if (!fp->f_ci) {
+		ret = -ENOMEM;
+		goto err_owner;
+	}
+
+	ret = __open_id_exact(fp, r->persistent_id);
+	if (ret) {
+		pr_err("CA recovery: persistent id %llu unavailable: %d\n",
+		       r->persistent_id, ret);
+		goto err_inode;
+	}
+
+	down_write(&fp->f_ci->m_lock);
+	list_add(&fp->node, &fp->f_ci->m_fp_list);
+	up_write(&fp->f_ci->m_lock);
+
+	/*
+	 * Rebuild the oplock/lease in the same detached shape a disconnect
+	 * leaves behind, so is_reconnectable() and the DH2C oplock checks see
+	 * what they expect.
+	 */
+	ret = ksmbd_oplock_recover(fp, r->oplock_level, r->is_lease, r->lctx);
+	if (ret)
+		goto err_unlink;
+
+	/*
+	 * The scavenger deadline is derived from jiffies, which restart at
+	 * zero, so rearm it from the wall-clock remainder the journal kept.
+	 */
+	if (fp->durable_timeout)
+		fp->durable_scavenger_timeout =
+			jiffies_to_msecs(jiffies) + r->remaining_ms;
+
+	fp->ca_store = ksmbd_ca_store_get(cas);
+	fp->f_state = FP_INITED;
+	return fp;
+
+err_unlink:
+	down_write(&fp->f_ci->m_lock);
+	list_del_init(&fp->node);
+	up_write(&fp->f_ci->m_lock);
+	__ksmbd_remove_durable_fd(fp);
+err_inode:
+	ksmbd_inode_put(fp->f_ci);
+err_owner:
+	kfree(fp->owner.name);
+err_free:
+	fd_limit_close();
 	kmem_cache_free(filp_cache, fp);
 	return ERR_PTR(ret);
 }
@@ -1815,6 +2012,21 @@ static bool session_fd_check(struct ksmbd_tree_connect *tcon,
 		fp->durable_scavenger_timeout =
 			jiffies_to_msecs(jiffies) + fp->durable_timeout;
 
+	/*
+	 * Record the disconnected state, including the wall-clock deadline, so
+	 * a server restart can bring this handle back with the right amount of
+	 * time left on it.  A journal failure only costs crash resilience for
+	 * this one handle -- the in-memory handle is still preserved, so the
+	 * client can reconnect as long as the server stays up.
+	 */
+	if (fp->is_persistent) {
+		int jret = ksmbd_ca_record_disconnect(fp);
+
+		if (jret)
+			pr_warn("CA journal update failed for persistent id %llu: %d\n",
+				fp->persistent_id, jret);
+	}
+
 	/* Drop fp's own reference on conn. */
 	ksmbd_conn_put(conn);
 	return true;
@@ -1851,6 +2063,13 @@ void ksmbd_free_global_file_table(void)
 {
 	struct ksmbd_file	*fp = NULL;
 	unsigned int		id;
+
+	/*
+	 * Every persistent handle in this table is one the client expects to
+	 * find again after a restart, so stop journalling before tearing them
+	 * down: the on-disk records must be left alone.
+	 */
+	ksmbd_ca_store_shutdown();
 
 	idr_for_each_entry(global_ft.idr, fp, id) {
 		ksmbd_remove_durable_fd(fp);
