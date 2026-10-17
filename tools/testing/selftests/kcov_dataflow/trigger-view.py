@@ -23,12 +23,15 @@ run_capture() does the work and is also what test_modules.py drives:
 The CLI then prints them as a call tree, or flat with --raw, with kallsyms
 symbol resolution and addr2line source lines (vmlinux / module .ko).
 
-With --dwarf, every record is also resolved through "sancov
--symbolize-dataflow" (found as --sancov, $SANCOV or on PATH), which joins the
+When sancov is found (--sancov, $SANCOV or PATH), every module record is
+also resolved through "sancov -symbolize-dataflow", which joins the
 __sancov_dataflow descriptor and the DWARF the compiler emitted for each call:
-records are then shown under the source parameter they hold, and the fields
-of an object read in memory under their struct member names. A pointer's
-pointee type is shown too, without values -- it is not read.
+values are shown under the source parameter they hold, a struct the ABI
+packed into a register is split into its members, and an object read in
+memory is shown by member. A pointer is shown with the type and members of
+what it points to; their values are not recorded -- the instrumentation
+never reads through a pointer -- so only the layout is known. --dwarf does
+the same for vmlinux records (-C), --no-dwarf turns it off.
 
 Recorded PCs have the KASLR offset removed (same as mainline kcov), so
 the runtime offset is derived from /proc/kallsyms and System.map / vmlinux
@@ -62,12 +65,15 @@ MAGIC_BAD = 0xBADADD85
 # missing; see Capture.saturated.
 BUF_SIZE = 4194304
 
-# Record header word: bits 0-23 seq | 28-31 type | 32-47 nvals |
-# 48-55 arg/ret size | 56-63 arg index. Word 1 is the pc (KASLR offset
-# removed, like mainline kcov), word 2 the traced pointer (ENTRY/RET) or the
-# comparison type (CMP), then nvals value words.
+# Record header word: bits 0-23 seq | 24 values read in memory | 28-31 type |
+# 32-47 nvals | 48-55 arg/ret size | 56-63 arg index. Word 1 is the pc (KASLR
+# offset removed, like mainline kcov), word 2 the address the values were read
+# at (ENTRY/RET) or the comparison type (CMP), then nvals value words.
 def hdr_seq(h):
     return h & 0x00FFFFFF
+
+def hdr_mem(h):
+    return bool((h >> 24) & 1)
 
 def hdr_type(h):
     return (h >> 28) & 0xF
@@ -457,8 +463,9 @@ def parse_records(buf, total_words):
             continue
 
         pc = int(buf[pos + 1]) + KASLR_OFFSET
-        # ENTRY/RET: the address the fields were read from, 0 when the record
-        # carries the value itself; CMP: the comparison type.
+        # ENTRY/RET: the address the values were read at (header bit 24),
+        # 0 when the record carries the value itself; CMP: the comparison
+        # type.
         addr = int(buf[pos + 2])
         if rtype == DF_TYPE_CMP:
             pos += RECORD_HDR_WORDS + num_vals
@@ -475,6 +482,7 @@ def parse_records(buf, total_words):
             "seq": hdr_seq(hdr),
             "pc": pc,
             "addr": addr,
+            "mem": hdr_mem(hdr),
             "arg_idx": hdr_arg_idx(hdr),
             "size": hdr_size(hdr),
             "val": vals[0],
@@ -688,16 +696,223 @@ def describe(rec, point):
     name = (src.get("parameter") or {}).get("name") or \
         ("return" if point["kind"] == "ret" else "?")
     out = f"{name}: {src.get('type', '?')}"
-    if obs.get("class") == "object":
-        fields = source_fields(point)
-        if len(fields) == len(rec["vals"]):
-            out += " {" + ", ".join(f".{f['name']}={format_val(v)}"
-                                    for f, v in zip(fields, rec["vals"])) + "}"
-    pointee = src.get("pointee")
-    if pointee:
-        members = ", ".join(f["name"] for f in pointee.get("fields", []))
-        out += f" -> {pointee.get('type', '?')} {{{members}}} (not read)"
+    if obs.get("class") == "object" or (src.get("indirect") and rec["mem"]):
+        out += " " + object_members(rec, source_fields(point), point)
+    out += pointee_layout(rec, point)
     return out
+
+
+FLOAT_TYPES = {"f32": "<f", "float": "<f", "f64": "<d", "double": "<d"}
+
+
+def decode_member(bits, member):
+    """A member's bits as text: a float as a float, anything else in hex."""
+    fmt = FLOAT_TYPES.get(member.get("type", ""))
+    if fmt and member.get("bit_size") == 8 * struct.calcsize(fmt):
+        raw = bits.to_bytes(8, "little")[:struct.calcsize(fmt)]
+        return f"{struct.unpack(fmt, raw)[0]:g}"
+    return format_val(bits)
+
+
+def _bits(word, bit_offset, bit_size):
+    return (word >> bit_offset) & ((1 << bit_size) - 1)
+
+
+MAX_POINTEE_MEMBERS = 8
+
+
+def short_type(name):
+    """A Rust type without its module path: crate::mod::S1 -> S1."""
+    if "<" in name or "::" not in name:
+        return name
+    return name.rsplit("::", 1)[-1]
+
+
+def is_snapshot(point):
+    """True if @point is a pointer reported with the bytes behind it."""
+    return "pointee" in ((point or {}).get("observation") or {}).get("flags", [])
+
+
+def snapshot_bytes(rec, point):
+    """
+    The bytes a memory record holds, as (bytes, bad) - bad the set of byte
+    offsets a read failed for - when its value words are known to be the
+    consecutive 8-byte pieces from offset 0 the compiler reads a pointee
+    snapshot as, or an object no IR element of which is narrower than its
+    8-byte piece (one wider than 8 bytes is read in 8-byte pieces too: all of
+    rustc's opaque [N x i8]). Else None.
+    """
+    vals, size = rec["vals"], rec["size"]
+    if not rec["mem"] or not size or len(vals) != (size + 7) // 8:
+        return None
+    if not is_snapshot(point) and size == 255:
+        return None   # a clamped header size says nothing
+    data = b"".join(v.to_bytes(8, "little") for v in vals)[:size]
+    bad = {i for w, v in enumerate(vals) if v == MAGIC_BAD
+           for i in range(8 * w, min(8 * w + 8, size))}
+    return data, bad
+
+
+def bytes_members(data, bad, members):
+    """[.member=value, ...] for @members cut out of @data by bit offset."""
+    word = int.from_bytes(data, "little")
+    out = []
+    for m in members:
+        off, size = m.get("bit_offset", 0), m.get("bit_size", 0)
+        lo, hi = off // 8, (off + size + 7) // 8
+        if not m.get("observed", True) or not size or hi > len(data):
+            out.append(f".{m['name']}=?")
+        elif any(i in bad for i in range(lo, hi)):
+            out.append(f".{m['name']}=FAULT")
+        else:
+            out.append(f".{m['name']}={decode_member(_bits(word, off, size), m)}")
+    return out
+
+
+def pointee_layout(rec, point):
+    """
+    ' -> Type {.member=value, ...}' for a pointer the kernel read the bytes
+    behind - as many as the compiler's IR said are dereferenceable - cut into
+    the members sancov says they hold; ' -> Type {member, ...} (not read)'
+    for a pointer it did not read behind, whose pointee's members are known
+    from DWARF but have no values; or ''.
+    """
+    pointee = ((point or {}).get("source") or {}).get("pointee")
+    if not pointee:
+        return ""
+    fields = pointee.get("fields", [])
+    snap = snapshot_bytes(rec, point) if is_snapshot(point) else None
+    if snap and pointee.get("bytes_read"):
+        parts = bytes_members(*snap, fields)
+        tail = ""
+    else:
+        parts = [f["name"] for f in fields]
+        tail = " (not read)"
+    if len(parts) > MAX_POINTEE_MEMBERS:
+        parts = parts[:MAX_POINTEE_MEMBERS] + \
+            [f"+{len(parts) - MAX_POINTEE_MEMBERS} more"]
+    members = " {" + ", ".join(parts) + "}" if parts else ""
+    return f" -> {short_type(pointee.get('type', '?'))}{members}{tail}"
+
+
+def object_members(rec, members, point=None):
+    """
+    {.member=value, ...} for an object the kernel read in memory.
+
+    The record holds one value word per piece the compiler described the
+    object's IR type as -- an element, or an 8-byte piece of one wider than
+    8 bytes -- and not where each lies. Three cases still say exactly which
+    bytes a word is: one element per DWARF member, in order, as clang lays
+    out a C struct; as many words as 8-byte pieces of the object, which then
+    are those pieces (see snapshot_bytes()), as for rustc's opaque [N x i8] or
+    a C struct with an array member; or a single word, the object's first
+    bytes. The second is a heuristic for an object: a struct whose padding
+    leaves an 8-byte piece without an element of its own, such as
+    { int a, b; __int128 c; }, has as many words but not those pieces.
+    Members a word does not cover were not read and show as '?'. Otherwise
+    the words are shown as they are.
+    """
+    vals = rec["vals"]
+    # A type DWARF gives no members for is one opaque field of its size,
+    # named after the parameter: nothing to split by.
+    if len(members) == 1 and members[0].get("bit_offset", 0) == 0 and \
+            members[0].get("bit_size", 0) >= 8 * rec["size"] and len(vals) == 1:
+        return format_val(vals[0])
+    snap = snapshot_bytes(rec, point)
+    if len(vals) != len(members) and snap and members:
+        return "{" + ", ".join(bytes_members(*snap, members)) + "}"
+    if len(vals) == len(members):
+        out = [f".{m['name']}={decode_member(v, m) if v != MAGIC_BAD else 'FAULT'}"
+               for m, v in zip(members, vals)]
+    elif len(vals) == 1:
+        out = []
+        for m in members:
+            off, size = m.get("bit_offset", 0), m.get("bit_size", 0)
+            if vals[0] != MAGIC_BAD and size and off + size <= 64:
+                out.append(f".{m['name']}={decode_member(_bits(vals[0], off, size), m)}")
+            else:
+                out.append(f".{m['name']}=?")
+    else:
+        return "{" + ", ".join(format_val(v) for v in vals) + "}"
+    return "{" + ", ".join(out) + "}"
+
+
+def format_record(rec, point):
+    """
+    What one record holds, named from its sancov @point: "name=value" for
+    an argument, "value" for a return. A value the ABI packed several
+    members into is split into them; an object read in memory is shown by
+    member; a pointer gets the type and members of what it points to, with
+    their values if the kernel read the bytes behind it. Without a point, the
+    plain value, under its IR index.
+    """
+    is_ret = rec["type"] == DF_TYPE_RET
+    plain = format_val(rec["val"]) if len(rec["vals"]) == 1 and not rec["mem"] \
+        else "{" + ", ".join(format_val(v) for v in rec["vals"]) + "}"
+    src = (point or {}).get("source") or {}
+    obs = (point or {}).get("observation") or {}
+    if src.get("provenance") not in ("exact", "heuristic"):
+        return plain if is_ret else f"arg{rec['arg_idx']}={plain}"
+    name = (src.get("parameter") or {}).get("name") or f"arg{rec['arg_idx']}"
+    if src.get("provenance") == "heuristic":
+        name += "?"   # sancov guessed the parameter by position
+    if rec["size"] == 0:
+        text = "<not reported>"
+    elif obs.get("class") == "object" or (rec["mem"] and src.get("indirect")):
+        # An object read in memory: passed or returned in memory, or one the
+        # parameter's address was passed for that the IR says may be read.
+        text = object_members(rec, source_fields(point), point)
+        return text if is_ret else f"{name}={text}"
+    elif is_snapshot(point):
+        # A pointer, and a snapshot of what it points to.
+        text = format_val(rec["addr"]) + pointee_layout(rec, point)
+    else:
+        # A value: each member DWARF places in it, by its bits in the value.
+        parts = []
+        for m in source_fields(point):
+            vbit = m.get("value_bit_offset")
+            if vbit is None or vbit + m["bit_size"] > 64:
+                continue
+            v = decode_member(_bits(rec["val"], vbit, m["bit_size"]), m)
+            whole = m["name"] in (name.rstrip("?"), "return")
+            parts.append(v if whole else f".{m['name']}={v}")
+        if not parts:
+            text = plain
+        elif len(parts) == 1 and not parts[0].startswith("."):
+            text = parts[0]
+        else:
+            # Members of a struct the ABI passed in this register.
+            if is_ret:
+                return "{" + ", ".join(parts) + "}"
+            return ", ".join(f"{name}{p}" for p in parts)
+        text += pointee_layout(rec, point)
+    return text if is_ret else f"{name}={text}"
+
+
+def lookup_point(rec, cap, smaps):
+    """The sancov point of @rec, or None."""
+    if not cap or not smaps:
+        return None
+    tgt = cap.binary_addr(rec)
+    smap = smaps.get(tgt[0]) if tgt else None
+    return smap.lookup(tgt[1]) if smap else None
+
+
+def load_source_maps(cap, records, sancov, vmlinux=False, log=None):
+    """
+    SourceMaps for the binaries @records are in: the module always, vmlinux
+    only if asked -- resolving all of vmlinux takes a while.
+    """
+    smaps = {}
+    for binary in {t[0] for t in map(cap.binary_addr, records) if t}:
+        if binary != cap.ko_path and not vmlinux:
+            continue
+        try:
+            smaps[binary] = SourceMap(binary, sancov)
+        except (OSError, ValueError) as e:
+            if log:
+                log(f"DWARF: {e}")
+    return smaps
 
 
 def print_raw(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_base=0,
@@ -721,19 +936,18 @@ def print_raw(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_ba
         left = f"{locs[i]:>{max_w}s}" if locs[i] else f"{'':>{max_w}s}"
         vals = format_val(r["val"]) if len(r["vals"]) == 1 else \
             "{" + ", ".join(format_val(v) for v in r["vals"]) + "}"
-        # Only an object read in memory (byval, sret) has an address to show.
-        at = f" @0x{r['addr']:x}" if r["addr"] else ""
+        # Only values read in memory (byval, sret, the bytes behind a
+        # dereferenceable pointer) have an address to show.
+        at = f" @0x{r['addr']:x}" if r["mem"] else ""
         # The arg_idx header bits exist in every record but only mean
         # something for ENTRY; RET has one logical return value and the
         # kernel writes zero there. Printing "arg[0]" for a return reads as
         # "return of argument 0", which is not a thing.
         what = f"arg[{r['arg_idx']}]({size})" if not is_ret else f"ret({size})"
         src = ""
-        if cap and smaps:
-            tgt = cap.binary_addr(r)
-            smap = smaps.get(tgt[0]) if tgt else None
-            if smap:
-                src = "  <- " + describe(r, smap.lookup(tgt[1]))
+        point = lookup_point(r, cap, smaps)
+        if point:
+            src = "  <- " + format_record(r, point)
         print(f"{left}   [{t}] seq={r['seq']:3d} {sym} "
               f"{what}{at} = {vals}{src}")
 
@@ -759,8 +973,13 @@ def frame_key(pc, syms):
     return (pc - offset, mod)
 
 
-def print_tree(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_base=0):
-    """Print records as indented call tree with source line on left."""
+def print_tree(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_base=0,
+               cap=None, smaps=None):
+    """
+    Print records as indented call tree with source line on left. With
+    @smaps (see load_source_maps()), every value is named after the source
+    parameter and members it holds; see format_record().
+    """
     if cache is None:
         cache = {}
     # Pre-resolve all PCs (one addr2line run) for alignment
@@ -787,8 +1006,12 @@ def print_tree(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_b
             first_pc = r["pc"]
             while i < len(records) and records[i]["type"] == DF_TYPE_ENTRY \
                     and frame_key(records[i]["pc"], syms) == key:
+                point = lookup_point(records[i], cap, smaps)
                 vals = records[i]["vals"]
-                if len(vals) > 1:
+                if point:
+                    args.append((records[i]["arg_idx"],
+                                 format_record(records[i], point)))
+                elif len(vals) > 1:
                     fields = ", ".join(format_val(v) for v in vals)
                     args.append((records[i]["arg_idx"], "{" + fields + "}"))
                 else:
@@ -816,9 +1039,13 @@ def print_tree(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_b
             # one value word per field, with word [2] holding the address they
             # were read from. Render it as {f0, f1, ...} rather than as
             # vals[0], which is indistinguishable from a scalar return.
-            ret_val = format_val(r["val"]) if len(r["vals"]) == 1 else \
-                "{" + ", ".join(format_val(v) for v in r["vals"]) + "}"
-            if r["addr"]:
+            point = lookup_point(r, cap, smaps)
+            if point:
+                ret_val = format_record(r, point)
+            else:
+                ret_val = format_val(r["val"]) if len(r["vals"]) == 1 else \
+                    "{" + ", ".join(format_val(v) for v in r["vals"]) + "}"
+            if r["mem"] and not is_snapshot(point):
                 ret_val += f" @0x{r['addr']:x}"
             if call_stack:
                 cname, cmod, cargs, _, cpc = call_stack.pop()
@@ -859,10 +1086,14 @@ def main():
                         help="Use KCOV_DF_REMOTE_ENABLE for kworker capture")
     parser.add_argument("--kaslr-offset", type=lambda x: int(x, 0),
                         help="Override the runtime KASLR offset added to PCs")
+    parser.add_argument("--no-dwarf", action="store_true",
+                        help="Do not name parameters and struct members from "
+                             "the module's DWARF (sancov -symbolize-dataflow)")
     parser.add_argument("--dwarf", action="store_true",
-                        help="With --raw: name the source parameter and struct "
-                             "fields of each record (sancov -symbolize-dataflow)")
-    parser.add_argument("--sancov", help="sancov binary for --dwarf")
+                        help="Name them for vmlinux records too (slow: "
+                             "resolves all of vmlinux)")
+    parser.add_argument("--sancov", help="sancov binary (default: $SANCOV, "
+                        "then PATH)")
     args = parser.parse_args()
 
     ko_path = args.ko or find_module(args.module)
@@ -899,23 +1130,19 @@ def main():
     print_kernel_meta(meta, ko_path=ko_path)
 
     vmlinux = find_vmlinux(args.vmlinux)
-    if args.raw:
-        smaps = {}
-        if args.dwarf:
-            sancov = find_sancov(args.sancov)
-            if not sancov:
-                print("# --dwarf: no sancov (--sancov, $SANCOV or PATH)",
-                      file=sys.stderr)
-            else:
-                for binary in {t[0] for t in map(cap.binary_addr, records) if t}:
-                    try:
-                        smaps[binary] = SourceMap(binary, sancov)
-                    except (OSError, ValueError) as e:
-                        print(f"# --dwarf: {e}", file=sys.stderr)
-        print_raw(records, cap.syms, vmlinux, {}, ko_path, cap.mod_text_start,
-                  cap, smaps)
-    else:
-        print_tree(records, cap.syms, vmlinux, {}, ko_path, cap.mod_text_start)
+    smaps = {}
+    if not args.no_dwarf:
+        sancov = find_sancov(args.sancov)
+        if sancov:
+            smaps = load_source_maps(
+                cap, records, sancov, vmlinux=args.dwarf,
+                log=lambda m: print(f"# {m}", file=sys.stderr))
+        else:
+            print("# no sancov ($SANCOV, --sancov or PATH): values are shown "
+                  "by IR argument, without parameter or member names",
+                  file=sys.stderr)
+    show = print_raw if args.raw else print_tree
+    show(records, cap.syms, vmlinux, {}, ko_path, cap.mod_text_start, cap, smaps)
 
     print_kernel_meta(meta, ko_path=ko_path)
 

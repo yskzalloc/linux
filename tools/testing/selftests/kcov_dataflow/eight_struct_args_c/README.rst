@@ -10,12 +10,13 @@ vmalloc), pointer forwarding and a struct return value. Opted in with
 ``/sys/kernel/debug/kcov_dataflow_test/trigger_struct`` runs it::
 
   ./test_modules.py -t eight_struct_args_c
-  ./trigger-view.py eight_struct_args_c --raw --dwarf
+  ./trigger-view.py eight_struct_args_c --raw
 
 What is recorded is decided by the IR alone: an argument index is the IR
-position, a pointer is recorded as the address it holds and its pointee is
-never read, and only an object returned in memory is read, one value word
-per element of its IR type. Which parameter and which member a record holds
+position, a pointer is recorded as the address it holds -- a plain C
+pointer says nothing about how much of its pointee may be read, so none of
+it is -- and an object returned in memory is read, one value word per
+element of its IR type. Which parameter and which member a record holds
 comes from the module's DWARF, through ``sancov -symbolize-dataflow``.
 
 Pointer arguments
@@ -35,9 +36,11 @@ objects ``v1`` .. ``v8`` every time. test_modules.py checks that:
 
 Through DWARF, each sf_N record names its parameter (``a`` .. ``h``) and the
 pointee type ``struct sK`` with its members ``a``, ``b``, ... at 64-bit
-steps -- their layout, not their values::
+steps -- their layout, not their values, every member ``"observed": false``
+with ``bytes_read`` 0 (rust_ffi_contract shows a C parameter whose pointee
+is recorded: declared ``alloc[static 1]``)::
 
-  [ENTRY] seq=... sf_3+0x36 [eight_struct_args_c] arg[0](8) = 0xffff88800985fd28  <- a: s1 * -> s1 {a} (not read)
+  [ENTRY] seq=... sf_3+0x36 [eight_struct_args_c] arg[0](8) = 0xffff88800558fd38  <- a=0xffff88800558fd38 -> s1 {a} (not read)
 
 Object returns
 --------------
@@ -49,7 +52,7 @@ reports that buffer as an object: one value word per element of its IR
 type, ``%struct.s4 = { i64, i64, i64, i64 }``, word [2] of the record
 holding the address they were read from, and ``size`` the whole object::
 
-  [RET  ] seq=... sf_ret_struct+0x.. ret(32) @0xffff88800985f8b8 = {0x11, 0x11, 0x22, 0x33}  <- return: s4 {.a=0x11, .b=0x11, .c=0x22, .d=0x33}
+  [RET  ] seq=... sf_ret_struct+0x.. ret(32) @0xffff88800558f8c8 = {0x11, 0x11, 0x22, 0x33}  <- {.a=0x11, .b=0x11, .c=0x22, .d=0x33}
 
 The fields follow from ``v1 = {0x11}`` and ``v2 = {0x11, 0x22}``:
 ``{.a = a->a, .b = b->a, .c = b->b, .d = a->a + b->b}``. test_modules.py

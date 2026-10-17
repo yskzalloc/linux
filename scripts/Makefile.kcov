@@ -29,6 +29,13 @@ kcov-dataflow-noinline-$(CONFIG_KCOV_DATAFLOW_NO_INLINE) += -fno-inline
 kcov-dataflow-rflags-$(CONFIG_KCOV_DATAFLOW_ARGS) += -Cllvm-args=-sanitizer-coverage-trace-args
 kcov-dataflow-rflags-$(CONFIG_KCOV_DATAFLOW_RET) += -Cllvm-args=-sanitizer-coverage-trace-ret
 
+# How far behind a pointer the IR says is dereferenceable to read; unset (a
+# compiler without the option) leaves the compiler's default.
+ifdef CONFIG_KCOV_DATAFLOW_POINTEE_BYTES
+kcov-dataflow-flags-y += -mllvm -sanitizer-coverage-trace-pointee-bytes=$(CONFIG_KCOV_DATAFLOW_POINTEE_BYTES)
+kcov-dataflow-rflags-y += -Cllvm-args=-sanitizer-coverage-trace-pointee-bytes=$(CONFIG_KCOV_DATAFLOW_POINTEE_BYTES)
+endif
+
 export CFLAGS_KCOV_DATAFLOW := $(kcov-dataflow-flags-y)
 export CFLAGS_KCOV_DATAFLOW_NO_INLINE := $(kcov-dataflow-noinline-y)
 export RUSTFLAGS_KCOV_DATAFLOW := $(kcov-dataflow-rflags-y)

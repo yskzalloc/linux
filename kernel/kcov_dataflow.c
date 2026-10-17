@@ -374,7 +374,8 @@ kcov_df_reserve(struct task_struct *t, u64 *area, u32 record_len,
  *
  * Beyond the obvious !in_task() case, this bails whenever page faults are
  * disabled. copy_from_kernel_nofault() -- used by kcov_df_write() below to read
- * the fields of an object passed or returned in memory, and, crucially, by the
+ * the fields of an object passed or returned in memory and the bytes behind a
+ * dereferenceable pointer, and, crucially, by the
  * ORC stack unwinder that KASAN runs on every slab free (set_track_prepare() ->
  * stack_trace_save()) -- brackets its raw loads with pagefault_disable(), and
  * those loads carry trace-cmp/trace-args instrumentation. Without this bail a
@@ -425,9 +426,10 @@ kcov_df_next_seq(struct task_struct *t)
 }
 
 static __always_inline notrace __no_sanitize_coverage u64
-kcov_df_hdr(u64 type, u32 nvals, u32 size, u32 arg_idx, u32 seq)
+kcov_df_hdr(u64 type, u32 nvals, u32 size, u32 arg_idx, u32 seq, bool mem)
 {
 	return (type << KCOV_DF_HDR_TYPE_SHIFT) |
+	       (mem ? KCOV_DF_HDR_MEM : 0) |
 	       ((u64)nvals << KCOV_DF_HDR_NVALS_SHIFT) |
 	       ((u64)min_t(u32, size, KCOV_DF_HDR_SIZE_MASK) <<
 		KCOV_DF_HDR_SIZE_SHIFT) |
@@ -442,13 +444,19 @@ kcov_df_hdr(u64 type, u32 nvals, u32 size, u32 arg_idx, u32 seq)
  *
  * @num_fields says what @val is. Zero means @val is the traced value itself,
  * @size bytes of it, and it is recorded as it comes -- no memory is touched.
- * Non-zero means @val is the address of an object and @offsets is the
- * compiler-supplied table of that many (offset, size) pairs to read out of it;
- * it is clamped to KCOV_DF_MAX_VALS so the record length can never wrap and the
- * field loop is bounded by the words actually reserved. A @size of zero means
- * the compiler had no value to report: a value with no fixed-size bit pattern,
- * or an in-memory object the function never uses, whose caller may pass
- * anything (dead argument elimination hands it poison) -- so it is not read.
+ * Non-zero means @val is the address of @size bytes and @offsets is the
+ * compiler-supplied table of that many (offset, size) pairs to read out of
+ * them, none wider than a word; it is clamped to KCOV_DF_MAX_VALS so the record
+ * length can never wrap and the field loop is bounded by the words actually
+ * reserved. The bytes are an object the ABI passed or returned in memory, or
+ * the first bytes a pointer points to that the IR says are dereferenceable
+ * (a raw snapshot, bounded by CONFIG_KCOV_DATAFLOW_POINTEE_BYTES); the
+ * record is the same either way, and the __sancov_dataflow descriptor of
+ * the pc tells them apart. A dereferenceable_or_null pointer may be NULL.
+ * A @size of zero means the compiler had no value to report: a value with
+ * no fixed-size bit pattern, or an in-memory object the function never uses,
+ * whose caller may pass anything (dead argument elimination hands it poison)
+ * -- so it is not read.
  */
 static noinline notrace __no_sanitize_coverage void
 kcov_df_write(u64 type, u64 pc, u32 arg_idx, u32 size, u64 val,
@@ -489,7 +497,8 @@ kcov_df_write(u64 type, u64 pc, u32 arg_idx, u32 size, u64 val,
 		goto out;
 
 	seq = kcov_df_next_seq(t);
-	area[start_index] = kcov_df_hdr(type, nvals, size, arg_idx, seq);
+	area[start_index] = kcov_df_hdr(type, nvals, size, arg_idx, seq,
+					num_fields != 0);
 	area[start_index + 1] = kcov_df_canonicalize_ip(pc);
 	/*
 	 * Word [2] is the address the field values were read from, and zero for
@@ -503,7 +512,8 @@ kcov_df_write(u64 type, u64 pc, u32 arg_idx, u32 size, u64 val,
 		 * the field path below there is no nofault read and no way for
 		 * this to fail -- a size of zero is the compiler telling us it
 		 * had nothing to report. A pointer is recorded as the address
-		 * it holds; what it points to is never read.
+		 * it holds; what it points to is read only on the path below,
+		 * when the compiler says how far that is safe.
 		 */
 		area[start_index + 3] = size ? val : KCOV_DF_MAGIC_BAD;
 	} else {
@@ -554,14 +564,16 @@ out:
  *
  * objtool validates a listed function with AC set and rejects any out-of-line
  * call from it, and kcov_df_write() calls copy_from_kernel_nofault() to read
- * an object passed or returned in memory, so bracket the call with
+ * an object passed or returned in memory, or the bytes behind a
+ * dereferenceable pointer, so bracket the call with
  * user_access_save()/restore(): that clears AC
  * for the whole record write (the kasan_report() pattern) and keeps SMAP/PAN
  * protection in force while the collector runs. It compiles to nothing on
  * architectures without the feature.
  *
  * @val is the traced value itself, or, when @num_fields is non-zero, the address
- * of the object whose fields @offsets describes. See kcov_df_write().
+ * of the bytes @offsets describes: an object, or what a pointer points to. See
+ * kcov_df_write().
  *
  * Neither callback is told which function it speaks for: the instrumented
  * location is the return address, as it is for the __sanitizer_cov_trace_cmp*()
@@ -657,7 +669,7 @@ kcov_df_trace_cmp(u64 cmp_type, u64 arg1, u64 arg2, u64 ip)
 		goto out;
 
 	seq = kcov_df_next_seq(t);
-	area[start_index]     = kcov_df_hdr(KCOV_DF_TYPE_CMP, 2, 0, 0, seq);
+	area[start_index]     = kcov_df_hdr(KCOV_DF_TYPE_CMP, 2, 0, 0, seq, false);
 	area[start_index + 1] = kcov_df_canonicalize_ip(ip);
 	area[start_index + 2] = cmp_type;
 	area[start_index + 3] = arg1;

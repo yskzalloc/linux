@@ -2243,8 +2243,10 @@ config KCOV_DATAFLOW_ARGS
 	  Captures function arguments at entry via /sys/kernel/debug/kcov_dataflow.
 	  One record per argument of the function as the compiler lowered it
 	  (its IR arguments): a value is recorded as it is -- a pointer as the
-	  address it holds, its pointee is not read -- and an argument the ABI
-	  passes in memory (byval) as the fields of that object.
+	  address it holds -- and an argument the ABI passes in memory (byval)
+	  as the fields of that object. A pointer the compiler's IR says is
+	  dereferenceable (a Rust reference, not a plain C pointer) also comes
+	  with the bytes it points to; see KCOV_DATAFLOW_POINTEE_BYTES.
 	  Enable per-module with: KCOV_DATAFLOW_file.o := y in the Makefile.
 	  Requires clang with -fsanitize-coverage=trace-args support (and,
 	  with CONFIG_RUST, a rustc whose LLVM has the matching pass).
@@ -2263,13 +2265,37 @@ config KCOV_DATAFLOW_RET
 	help
 	  Captures function return values via /sys/kernel/debug/kcov_dataflow.
 	  A returned value is recorded as it is, a pointer as the address it
-	  holds; a struct returned through a caller-provided buffer (sret) is
+	  holds, with the bytes it points to if the IR says they may be read;
+	  a struct returned through a caller-provided buffer (sret) is
 	  recorded as the fields of that buffer.
 	  Enable per-module with: KCOV_DATAFLOW_file.o := y in the Makefile.
 	  Requires clang with -fsanitize-coverage=trace-ret support (and,
 	  with CONFIG_RUST, a rustc whose LLVM has the matching pass).
 	  As for KCOV_DATAFLOW_ARGS, debug information is only needed to map
 	  records back to the source.
+
+config KCOV_DATAFLOW_POINTEE_BYTES
+	int "Bytes recorded behind a dereferenceable pointer"
+	depends on KCOV_DATAFLOW_ARGS || KCOV_DATAFLOW_RET
+	depends on $(cc-option,-mllvm -sanitizer-coverage-trace-pointee-bytes=0)
+	depends on !RUST || $(rustc-option,-Cllvm-args=-sanitizer-coverage-trace-pointee-bytes=0)
+	range 0 255
+	default 64
+	help
+	  A pointer argument, or pointer return value, that the compiler's IR
+	  says is dereferenceable(N) is recorded with a raw snapshot of the
+	  first min(N, this many) bytes it points to, read with
+	  copy_from_kernel_nofault() like an object passed in memory. Only
+	  the IR decides N, never debug information: rustc gives &T and
+	  &mut T arguments dereferenceable(size_of::<T>()), clang a C++
+	  reference, a struct arm64 passes by reference and a C
+	  "T p[static 1]" parameter, while a plain C pointer has no such
+	  attribute and is recorded by value only.
+	  Offline, "sancov -symbolize-dataflow" says which members of the
+	  pointee's DWARF type the snapshot holds.
+
+	  Each 8 bytes cost a record word. 0 records every pointer by value
+	  only. At most 255, the largest size a record header holds.
 
 config KCOV_DATAFLOW_NO_INLINE
 	bool "Disable inlining for dataflow-instrumented files"

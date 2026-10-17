@@ -166,7 +166,8 @@ Each record occupies 3 + N words:
        (clamped to 255), bits[47:32] = num_vals (>= 1),
        bits[31:28] = type: ``KCOV_DF_TYPE_ENTRY`` (0xE),
        ``KCOV_DF_TYPE_RET`` (0xF) or ``KCOV_DF_TYPE_CMP`` (0xC),
-       bits[23:0] = sequence number
+       bit 24 = ``KCOV_DF_HDR_MEM``: the values were read in memory at
+       word 2, bits[23:0] = sequence number
    * - 1
      - pc
      - Address of the call that produced the record, with the KASLR offset
@@ -184,8 +185,10 @@ Each record occupies 3 + N words:
        bits from linux/kcov.h
    * - 3..3+num_vals
      - values
-     - The fields of an object in memory, a single value, or the two CMP
-       operands
+     - A single value; with ``KCOV_DF_HDR_MEM``, up to 8 bytes each read at
+       word 2, in memory order from the word's lowest-addressed byte and
+       zero-filled -- the fields of an object in memory, or 8-byte pieces of
+       what a pointer points to; or the two CMP operands
 
 ``area[0]`` never exceeds the buffer size minus one and every counted word
 has been written, so a consumer that walks ``area[0]`` words never leaves
@@ -202,13 +205,32 @@ with or without debug information:
   same ``arg_idx`` (``[2 x i64]`` on arm64). A hidden struct-return pointer
   is not recorded, but keeps its position, so the next argument is index 1.
 - A value -- an integer, a pointer, a floating-point value -- is recorded as
-  it comes, with word 2 zero. A pointer is recorded as the address it holds;
-  what it points to is never read.
-- Only an object the IR marks as passed in memory (a ``byval`` argument, as
+  it comes, with word 2 zero. A pointer is recorded as the address it holds.
+- An object the IR marks as passed in memory (a ``byval`` argument, as
   x86_64 passes a large struct) or returned through a caller-provided buffer
   (``sret``) arrives as an address, which word 2 keeps; the fields of its IR
-  type are read out of it. A large struct arm64 passes by reference is a
-  plain pointer argument and recorded as one.
+  type are read out of it. A field wider than 8 bytes is read in 8-byte
+  pieces, and so is an object whose IR type is an opaque byte array, as
+  rustc types every struct it passes or returns in memory (``[32 x i8]``):
+  all of it is recorded, not its first 8 bytes. A large struct arm64 passes
+  by reference is a pointer argument, recorded as one -- and, as clang
+  marks it ``dereferenceable(sizeof(struct))``, with a snapshot of the
+  struct behind it (below).
+- A pointer argument or return value the IR says is ``dereferenceable(N)``
+  or ``dereferenceable_or_null(N)`` additionally comes with a raw snapshot of
+  what it points to: word 2 is the pointer, the size in the header is the
+  number of bytes read, min(N, ``CONFIG_KCOV_DATAFLOW_POINTEE_BYTES``), and
+  the values are those bytes 8 at a time. The record looks like one of an
+  object in memory; the ``__sancov_dataflow`` descriptor of its pc says it is
+  a pointer, and the DWARF says what the bytes are (see "Mapping records to
+  the source"). Which pointers get one is up to the compiler's IR: rustc
+  marks ``&T`` and ``&mut T`` arguments ``dereferenceable(size_of::<T>())``
+  and ``Option<&T>`` ``dereferenceable_or_null``, but not raw pointers,
+  slices, ``&`` of a ``!Freeze`` type (``Opaque<T>``, ``Cell``) or ``&mut``
+  of a ``!Unpin`` one, nor returns; clang marks C++ references, a struct
+  the ABI passes by reference (arm64, over 16 bytes) and a C array
+  parameter of static size (``const struct foo p[static 1]``), but no plain C
+  pointer.
 - An argument the function does not use is still recorded. If it is an
   object in memory, it is not read -- callers may pass anything for it --
   and is recorded with size 0.
@@ -216,16 +238,18 @@ with or without debug information:
 Magic values:
 
 - ``0xBADADD85``: a field read failed (the address was invalid, freed or
-  poisoned), or the header size is 0, meaning the compiler had no value to
-  report: an unused object, or a value with no fixed-size bit pattern
+  poisoned, or NULL, as a ``dereferenceable_or_null`` pointer may be), or the
+  header size is 0, meaning the compiler had no value to report: an unused
+  object, or a value with no fixed-size bit pattern
 
 Safety
 ------
 
 - Callbacks are ``notrace``, ``__no_sanitize_coverage``, ``noinline``
   to prevent recursion.
-- Only reading an object passed or returned in memory touches memory, and
-  it does so with
+- Only reading an object passed or returned in memory, or the bytes behind
+  a pointer the IR says are dereferenceable, touches memory, and it does so
+  with
   ``copy_from_kernel_nofault()`` -- surviving freed, poisoned or unmapped
   memory. A value that arrives in a register cannot fault at all.
 - An ``in_task()`` guard rejects calls from hardirq/softirq/NMI context,
@@ -456,12 +480,17 @@ Limitations
 -----------
 
 Pointer arguments
-    A pointer is recorded as the address it holds. The pointee is not read:
-    which bytes behind a pointer are valid to read at function entry is not
-    something the IR says in general, and reading what debug information
-    describes would let ``-g`` change what is recorded. The pointee's type
-    and field layout are available offline from DWARF (``sancov
-    -symbolize-dataflow`` reports them as ``pointee``), its values are not.
+    A pointer is recorded as the address it holds, and what it points to is
+    read only as far as the IR says it is dereferenceable. Which bytes behind
+    any other pointer are valid to read at function entry is not something
+    the IR says, and reading as far as debug information describes would let
+    ``-g`` change what is recorded. In practice that means the pointees of
+    Rust references are recorded and those of C pointers are not: of the
+    pointer arguments of a sample of 557 C objects of an x86_64 build, none
+    has a ``dereferenceable`` attribute; of those of ``rust/kernel.o`` and
+    the Rust binder driver, 42%. For the rest, the pointee's type and field
+    layout are available offline from DWARF (``sancov -symbolize-dataflow``
+    reports them as ``pointee``, with ``bytes_read`` 0), its values are not.
 
 Struct-by-value in registers
     A small struct passed or returned by value has no address once the ABI
@@ -487,7 +516,7 @@ Every trace-args/trace-ret call also gets a descriptor in the
 ``__sancov_dataflow`` section, kept in vmlinux and in modules: the call's
 address and what it reports -- the IR argument or return, which element of
 an aggregate, the value class (integer, pointer, float, vector, object) and
-size. With ``CONFIG_DEBUG_INFO`` the compiler adds a
+size, and whether a pointer came with a snapshot of its pointee. With ``CONFIG_DEBUG_INFO`` the compiler adds a
 ``DW_TAG_LLVM_sancov_observation`` DIE per observation to the function's
 DWARF, naming the source parameter, and the bits of it, that the
 observation holds. Neither changes what is recorded.
@@ -498,6 +527,10 @@ observation holds. Neither changes what is recorded.
 
 and reports, for every call site, its function and line, the observation,
 and the source parameter: its name and type, the struct fields of an object
-read in memory, and the pointee type and fields of a pointer. A record is
+read in memory, and the pointee type and fields of a pointer -- with
+``bytes_read``, the size of the snapshot, and which of the fields it holds
+wholly, in part (``"complete": false``) or not at all (``"observed":
+false``), so that a consumer can cut the value words of a snapshot record
+into members by their ``bit_offset``. A record is
 looked up by its ``pc`` (for a module, relative to the module's ``.text``):
 the address ``sancov`` reports for a call is the one the kernel records.

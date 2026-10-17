@@ -112,8 +112,10 @@ def check_struct_family(cap, recs, c, p, flat_ns, stpf8_runs):
     trigger, @stpf8_runs how often the pointer-linked tower is walked.
     """
     # The trigger passes the same objects v1..v8 to every sf_N, so arg k of
-    # each is the same pointer, &v(k+1). A pointer is recorded as its value,
-    # and its pointee is not read: one value word, no object address.
+    # each is the same pointer, &v(k+1). A plain pointer -- C's struct s1 *,
+    # Rust's *const S1 -- is recorded as its value, and its pointee is not
+    # read: the IR says nothing about how much of it may be. One value word,
+    # no object address.
     ptrs = pointer_args(cap, recs, c, f"{p}sf_{max(flat_ns)}", max(flat_ns))
     c.eq(f"{p}sf_N: the {len(ptrs)} objects are distinct",
          len(set(ptrs.values())), len(ptrs))
@@ -183,10 +185,10 @@ def check_struct_family(cap, recs, c, p, flat_ns, stpf8_runs):
 
     # The fields read are the elements of the buffer's IR type. clang gives
     # it %struct.s4 = { i64, i64, i64, i64 }: four fields. rustc gives
-    # sret([32 x i8]), one 32-byte field, and a value word holds the first 8
-    # bytes of a field: .a. DWARF knows all four members either way, but only
-    # what the IR type describes is read.
-    want = [0x11, 0x11, 0x22, 0x33] if not p else [0x11]
+    # sret([32 x i8]), one opaque 32-byte field, which the compiler describes
+    # in 8-byte pieces, as it does any field wider than a value word: four
+    # words again, the same bytes. (Before it did, only .a was read.)
+    want = [0x11, 0x11, 0x22, 0x33]
     got = ret_recs(cap, recs, f)
     c.true(f"{f}: RET record", bool(got))
     for r in got:
@@ -196,7 +198,7 @@ def check_struct_family(cap, recs, c, p, flat_ns, stpf8_runs):
         # address it read the fields from in word [2]. A scalar return leaves
         # it zero, so a non-zero value here is what distinguishes the two.
         c.true(f"{f} RET carries an object address, not a value "
-               f"(addr=0x{r['addr']:x})", r["addr"] != 0)
+               f"(addr=0x{r['addr']:x})", r["addr"] != 0 and r["mem"])
         c.true(f"{f} RET fields were readable (no KCOV_DF_MAGIC_BAD)",
                tv.MAGIC_BAD not in r["vals"])
 
@@ -213,9 +215,32 @@ def pointer_args_of(c, what, ents, k):
     for r in recs:
         c.true(f"{what} recorded as a value (nvals {len(r['vals'])}, "
                f"addr 0x{r['addr']:x}, size {r['size']})",
-               len(r["vals"]) == 1 and r["addr"] == 0 and r["size"] == 8)
+               len(r["vals"]) == 1 and r["addr"] == 0 and r["size"] == 8
+               and not r["mem"])
         c.true(f"{what} is a non-NULL pointer", r["val"] not in (0, tv.MAGIC_BAD))
         got.append(r["val"])
+    return got
+
+
+def snapshot_args_of(c, what, ents, k, size):
+    """
+    (pointer, value words) of the ENTRY records in @ents for IR argument @k,
+    each checked to be a pointer recorded with a snapshot of the @size bytes
+    behind it -- what the compiler's IR says are dereferenceable: the values
+    read in memory, word [2] the pointer, one word per 8 bytes.
+    """
+    got = []
+    recs = [r for r in ents if r["arg_idx"] == k]
+    c.true(f"{what}: ENTRY record", bool(recs))
+    for r in recs:
+        c.true(f"{what} recorded with a {size}-byte pointee snapshot (mem "
+               f"{r['mem']}, nvals {len(r['vals'])}, size {r['size']})",
+               r["mem"] and r["size"] == size and
+               len(r["vals"]) == (size + 7) // 8)
+        c.true(f"{what} is a non-NULL pointer", r["addr"] != 0)
+        c.true(f"{what}: snapshot readable (no KCOV_DF_MAGIC_BAD)",
+               tv.MAGIC_BAD not in r["vals"])
+        got.append((r["addr"], r["vals"]))
     return got
 
 
@@ -246,8 +271,12 @@ def check_rust_ffi_contract(cap, recs, c):
 
     alloc is passed by pointer, which is recorded as the address it holds:
     the violated contract shows in the return values at both boundaries,
-    and in both functions receiving the same object. Its fields are not
-    read -- the DWARF check names its type and layout, not its contents.
+    and in both functions receiving the same object. ffi_alloc_buf() takes
+    a plain struct ffi_alloc *, so its fields are not read there;
+    ffi_check_result() takes struct ffi_alloc alloc[static 1], which makes
+    the IR dereferenceable(24), so the kernel records the 24 bytes behind
+    it: { buffer = NULL, data_size = 256 + 16, free_async = 0, flags = 0 }
+    -- the NULL buffer of the violated contract, in the record itself.
     """
     ents = entries(cap, recs, "ffi_alloc_buf")
     by_arg = {r["arg_idx"]: r for r in ents}
@@ -264,10 +293,14 @@ def check_rust_ffi_contract(cap, recs, c):
 
     ents = entries(cap, recs, "ffi_check_result")
     c.true("ffi_check_result: ENTRY record", bool(ents))
-    got = pointer_args_of(c, "ffi_check_result arg[0] &alloc", ents, 0)
+    got = snapshot_args_of(c, "ffi_check_result arg[0] &alloc", ents, 0, 24)
     if alloc:
         c.eq("ffi_check_result arg[0] is the object ffi_alloc_buf filled in",
-             got, alloc[:1] * len(got))
+             [a for a, _ in got], alloc[:1] * len(got))
+    for _, vals in got:
+        # buffer, data_size, then free_async and flags in one word.
+        c.eq("ffi_check_result arg[0] *alloc as ffi_alloc_buf left it",
+             vals, [0, 256 + 16, 0])
     got = rets(cap, recs, "ffi_check_result")
     c.true(f"ffi_check_result RET -EFAULT: {fmt(got)}",
            len(got) == 1 and got[0] & 0xffffffff == 0xfffffff2)
@@ -284,6 +317,34 @@ def check_rust_kworker_remote(cap, recs, c):
     for phase in ("populate", "update", "drain"):
         c.true(f"CompositeStore::{phase} recorded",
                any("CompositeStore" in n and phase in n for n in names))
+
+    # Each phase takes &mut self, which rustc makes dereferenceable(24): the
+    # three RBTree roots behind it are recorded with the pointer. The trees
+    # are empty when populate() starts, and filled when update() and drain()
+    # do.
+    for phase, empty in (("populate", True), ("update", False),
+                         ("drain", False)):
+        func = composite_store_method(cap, recs, phase)
+        if not func:
+            continue
+        got = snapshot_args_of(c, f"CompositeStore::{phase} arg[0] self",
+                               entries(cap, recs, func), 0, 24)
+        for _, roots in got:
+            if empty:
+                c.eq(f"CompositeStore::{phase} self: empty tree roots",
+                     roots, [0, 0, 0])
+            else:
+                c.true(f"CompositeStore::{phase} self: filled tree roots "
+                       f"{fmt(roots)}", all(roots))
+
+
+def composite_store_method(cap, recs, phase):
+    """The kallsyms name of CompositeStore::@phase, or None."""
+    for r in recs:
+        for n in cap.funcs(r):
+            if "CompositeStore" in n and phase in n:
+                return n
+    return None
 
 
 # --- DWARF: which source parameter, and which member, each record holds ---
@@ -314,7 +375,7 @@ class Dwarf:
 def check_dwarf_records(cap, recs, c, dw):
     """Every module record agrees with the descriptor and DWARF of its call."""
     stats = {"records": 0, "exact": 0, "positional": 0, "objects": 0,
-             "pointees": 0}
+             "pointees": 0, "snapshots": 0}
     for r in recs:
         stats["records"] += 1
         p = dw.point(r)
@@ -329,10 +390,15 @@ def check_dwarf_records(cap, recs, c, dw):
         if kind == "args":
             c.eq(f"DWARF: {what}: descriptor IR argument", obs.get("ir_arg"),
                  r["arg_idx"])
-        # A record with an object address read an object; the descriptor
-        # must say the call reports one.
-        c.eq(f"DWARF: {what}: descriptor says object",
-             obs.get("class") == "object", r["addr"] != 0)
+        # A record of values read in memory read an object, or the bytes
+        # behind a pointer the IR says are dereferenceable; the descriptor
+        # must say the call reports one of those, and which.
+        snapshot = "pointee" in obs.get("flags", [])
+        c.eq(f"DWARF: {what}: descriptor says object or pointee snapshot",
+             obs.get("class") == "object" or snapshot, r["mem"])
+        if snapshot:
+            c.eq(f"DWARF: {what}: a pointee snapshot is of a pointer",
+                 obs.get("class"), "pointer")
         if obs.get("class") != "object":
             c.eq(f"DWARF: {what}: descriptor size", min(obs.get("size", 0), 255),
                  r["size"])
@@ -348,11 +414,16 @@ def check_dwarf_records(cap, recs, c, dw):
             c.true(f"DWARF: {what}: resolved exactly ({src.get('summary')})", False)
         stats["objects"] += obs.get("class") == "object"
         stats["pointees"] += bool(src.get("pointee"))
+        stats["snapshots"] += bool((src.get("pointee") or {}).get("bytes_read"))
     return stats
 
 
-def check_param(c, dw, what, rec, name, number, pointee=None, members=None):
-    """The record holds source parameter @name (1-based @number)."""
+def check_param(c, dw, what, rec, name, number, pointee=None, members=None,
+                bytes_read=0):
+    """
+    The record holds source parameter @name (1-based @number), a pointer to
+    @pointee with @members if given, @bytes_read of which were recorded.
+    """
     p = dw.point(rec)
     src = (p or {}).get("source") or {}
     par = src.get("parameter") or {}
@@ -364,6 +435,14 @@ def check_param(c, dw, what, rec, name, number, pointee=None, members=None):
                pointee in str(pt.get("type")))
         c.eq(f"DWARF: {what}: pointee members",
              [(f["name"], f["bit_offset"]) for f in pt.get("fields", [])], members)
+        c.eq(f"DWARF: {what}: pointee bytes read", pt.get("bytes_read"),
+             bytes_read)
+        # Every member within the bytes read is observed, every one beyond
+        # them, or of a pointee that was not read, is not.
+        for f in pt.get("fields", []):
+            inside = f["bit_offset"] + f["bit_size"] <= 8 * bytes_read
+            c.eq(f"DWARF: {what}: pointee member {f['name']} observed",
+                 f.get("observed", True), inside)
 
 
 def dwarf_struct_family(cap, recs, c, dw, p, flat_ns):
@@ -375,7 +454,7 @@ def dwarf_struct_family(cap, recs, c, dw, p, flat_ns):
                 continue        # rsf_1 aliased with rstf_1
             # sf_N(struct s1 *a, ..., struct sN *h): the pointee layout is
             # the struct's, member j at bit 64 * j -- the fields a consumer
-            # would name, were they read.
+            # would name, were they read. A plain pointer: none are.
             check_param(c, dw, f"{p}sf_{n} arg[{k}]", r, names[k], k + 1,
                         pointee=f"{'S' if p else 's'}{k + 1}",
                         members=[(names[j], 64 * j) for j in range(k + 1)])
@@ -398,21 +477,16 @@ def dwarf_struct_family(cap, recs, c, dw, p, flat_ns):
         fields = tv.source_fields(pt)
         c.eq(f"DWARF: {f} RET members", [(m["name"], m["bit_offset"]) for m in fields],
              [("a", 0), ("b", 64), ("c", 128), ("d", 192)])
-        # The object's fields were read, and each value word is a member --
-        # when the IR type has one element per member, which a consumer can
-        # only tell by the count: the record does not say where in the object
-        # each word was read from.
+        # The object's fields were read, and each value word is a member: as
+        # clang lays out the IR type, one element per member, and as rustc's
+        # opaque [32 x i8] is read, in 8-byte pieces that here are members.
+        c.eq(f"DWARF: {f} RET: a value word per member", len(r["vals"]),
+             len(fields))
         if len(fields) == len(r["vals"]):
             got = {m["name"]: v for m, v in zip(fields, r["vals"])}
             c.eq(f"DWARF: {f} RET by member", got,
                  {"a": 0x11, "b": 0x11, "c": 0x22, "d": 0x33})
             ksft.print_msg(f"DWARF: {f} {tv.describe(r, pt)}")
-        else:
-            ksft.print_msg(f"DWARF: {f} RET: {len(r['vals'])} value word(s) for "
-                           f"{len(fields)} members "
-                           f"({', '.join(m['name'] for m in fields)}): the IR "
-                           f"type does not describe the members, so they are "
-                           f"not read one by one")
 
 
 def dwarf_eight_struct_args_c(cap, recs, c, dw):
@@ -429,7 +503,8 @@ def dwarf_rust_ffi_contract(cap, recs, c, dw):
         name = ("alloc", "data_size", "offsets_size", "is_async")[k] if k < 4 else "?"
         if k == 0:
             # The fields that show the violated contract: their names and
-            # places are known from DWARF, their values are not recorded.
+            # places are known from DWARF; a plain pointer, so their values
+            # are not recorded here.
             check_param(c, dw, "ffi_alloc_buf arg[0]", r, "alloc", 1,
                         pointee="ffi_alloc",
                         members=[("buffer", 0), ("data_size", 64),
@@ -438,10 +513,45 @@ def dwarf_rust_ffi_contract(cap, recs, c, dw):
         else:
             check_param(c, dw, f"ffi_alloc_buf arg[{k}]", r, name, k + 1)
     for r in entries(cap, recs, "ffi_check_result"):
+        # alloc[static 1]: all 24 bytes recorded, and DWARF cuts them into
+        # the members, the NULL buffer among them.
+        p = dw.point(r)
         check_param(c, dw, "ffi_check_result arg[0]", r, "alloc", 1,
                     pointee="ffi_alloc",
                     members=[("buffer", 0), ("data_size", 64),
-                             ("free_async", 128), ("flags", 160)])
+                             ("free_async", 128), ("flags", 160)],
+                    bytes_read=24)
+        snap = tv.snapshot_bytes(r, p)
+        if snap:
+            c.eq("DWARF: ffi_check_result *alloc by member",
+                 tv.bytes_members(*snap, p["source"]["pointee"]["fields"]),
+                 [".buffer=0x0", ".data_size=0x110", ".free_async=0x0",
+                  ".flags=0x0"])
+        else:
+            c.true("DWARF: ffi_check_result arg[0]: a snapshot record", False)
+        ksft.print_msg(f"DWARF: ffi_check_result {tv.describe(r, p)}")
+
+
+def dwarf_rust_kworker_remote(cap, recs, c, dw):
+    """&mut self of CompositeStore: a 24-byte snapshot of three RBTrees."""
+    for phase in ("populate", "update", "drain"):
+        func = composite_store_method(cap, recs, phase)
+        for r in entries(cap, recs, func) if func else []:
+            if r["arg_idx"] != 0:
+                continue
+            p = dw.point(r)
+            pt = ((p or {}).get("source") or {}).get("pointee") or {}
+            c.true(f"DWARF: CompositeStore::{phase} self: pointee type "
+                   f"{pt.get('type')!r}", "CompositeStore" in str(pt.get("type")))
+            c.eq(f"DWARF: CompositeStore::{phase} self: pointee bytes read",
+                 pt.get("bytes_read"), 24)
+            # rustc may reorder the fields; the three roots fill 24 bytes.
+            c.eq(f"DWARF: CompositeStore::{phase} self: members at",
+                 sorted(f["bit_offset"] for f in pt.get("fields", [])),
+                 [0, 64, 128])
+            c.true(f"DWARF: CompositeStore::{phase} self: all members observed",
+                   all(f.get("observed", True) for f in pt.get("fields", [])))
+            ksft.print_msg(f"DWARF: CompositeStore::{phase} {tv.describe(r, p)}")
 
 
 TESTS = (
@@ -450,15 +560,18 @@ TESTS = (
      dwarf_eight_struct_args_c),
     ("eight_struct_args_rust", False, check_eight_struct_args_rust,
      dwarf_eight_struct_args_rust),
-    ("rust_kworker_remote", True, check_rust_kworker_remote, None),
+    ("rust_kworker_remote", True, check_rust_kworker_remote,
+     dwarf_rust_kworker_remote),
 )
 
 
-def diag_tree(cap, recs, vmlinux):
+def diag_tree(cap, recs, vmlinux, smap=None):
+    """The call tree, values named from the module's DWARF when @smap."""
     out = io.StringIO()
+    smaps = {cap.ko_path: smap} if smap else None
     with contextlib.redirect_stdout(out):
         tv.print_tree(recs, cap.syms, vmlinux, {}, cap.ko_path,
-                      cap.mod_text_start)
+                      cap.mod_text_start, cap, smaps)
     for line in out.getvalue().splitlines():
         ksft.print_msg(line)
 
@@ -515,26 +628,29 @@ def main():
             ksft.print_msg(f"{name}: WARNING: capture buffer full at "
                            f"{tv.BUF_SIZE} words; the end of the run was "
                            f"dropped, so later records are missing")
-        diag_tree(cap, cap.context_records(args.context) if args.context
-                  else recs, vmlinux)
-
         c = Check()
-        check(cap, recs, c)
+        smap = None
         if sancov:
             try:
-                dw = Dwarf(cap, tv.SourceMap(ko, sancov))
+                smap = tv.SourceMap(ko, sancov)
             except (OSError, ValueError) as e:
                 c.true(f"DWARF: {e}", False)
-            else:
-                st = check_dwarf_records(cap, recs, c, dw)
-                ksft.print_msg(f"{name}: DWARF: {st['records']} records, "
-                               f"{st['exact']} resolved exactly, "
-                               f"{st['positional']} unused ones by position, "
-                               f"{st['objects']} objects read by member, "
-                               f"{st['pointees']} pointers with a pointee "
-                               f"layout (not read)")
-                if dwarf_check:
-                    dwarf_check(cap, recs, c, dw)
+        diag_tree(cap, cap.context_records(args.context) if args.context
+                  else recs, vmlinux, smap)
+
+        check(cap, recs, c)
+        if smap:
+            dw = Dwarf(cap, smap)
+            st = check_dwarf_records(cap, recs, c, dw)
+            ksft.print_msg(f"{name}: DWARF: {st['records']} records, "
+                           f"{st['exact']} resolved exactly, "
+                           f"{st['positional']} unused ones by position, "
+                           f"{st['objects']} objects read by member, "
+                           f"{st['pointees']} pointers with a pointee "
+                           f"layout, {st['snapshots']} of them with the "
+                           f"bytes behind them recorded")
+            if dwarf_check:
+                dwarf_check(cap, recs, c, dw)
         for f in c.failures:
             ksft.print_msg(f"FAIL {name}: {f}")
         ksft.test_result(not c.failures, name)

@@ -10,7 +10,7 @@ writing ``/sys/kernel/debug/kcov_dataflow_test/trigger_struct_rust`` runs
 it::
 
   ./test_modules.py -t eight_struct_args_rust
-  ./trigger-view.py eight_struct_args_rust --raw --dwarf
+  ./trigger-view.py eight_struct_args_rust --raw
 
 As in the C module, what is recorded is decided by the IR alone, and which
 parameter and member a record holds comes from DWARF, through ``sancov
@@ -34,7 +34,11 @@ skips its DWARF check when the merged body is ``rstf_1``'s.
 
 Through DWARF, each record names its parameter (``a`` .. ``h``) and the
 pointee ``S1`` .. ``S8`` with its members ``a``, ``b``, ... at 64-bit steps.
-``#[repr(C)]`` is what gives those members the C layout.
+``#[repr(C)]`` is what gives those members the C layout. The parameters are
+raw pointers, which rustc does not mark ``dereferenceable``, so, as in C,
+the pointee is not read; a ``&S1`` would be (see rust_kworker_remote)::
+
+  eight_struct_args_rust.rs:380     0x10ef = rstpf_8+0x2f(p=0xffff888002a9cc80 -> Stp8 {field0, field1, field2, field3, field4, field5, field6, field7} (not read))
 
 Object returns
 --------------
@@ -48,15 +52,13 @@ address it was read from in word [2] of the record and ``size`` the whole 32
 bytes.
 
 Unlike clang, rustc types the buffer ``sret([32 x i8])``: an IR type with one
-32-byte element, not four ``i64`` members. What is read is one value word per
-IR element, and a value word holds the first 8 bytes of one, so the record
-carries ``.a`` alone::
+opaque 32-byte element, not four ``i64`` members. The compiler describes an
+element wider than a value word in 8-byte pieces, so the record still carries
+four words, the whole object, which DWARF's ``S4 { a, b, c, d }`` names::
 
-  [RET  ] seq=... rsf_ret_struct+0x.. ret(32) @0xffff8880389474d8 = 0x11
+  eight_struct_args_rust.rs:485     {.a=0x11, .b=0x11, .c=0x22, .d=0x33} @0xffff888005f374e8 = rsf_ret_struct+0x3b(...)
 
-DWARF still describes ``S4 { a, b, c, d }``, but the IR type the
-instrumentation goes by does not, so ``b``, ``c`` and ``d`` are not read.
-test_modules.py asserts exactly that -- the object size, the non-zero object
-address and the one word -- and checks the four members through DWARF; with
-one value word for four members it reports them as not read one by one,
-rather than naming the word.
+test_modules.py asserts the same four words as for the C module, the object
+size and the non-zero object address, and checks the four members through
+DWARF. (Before the pieces, one value word held the element's first 8 bytes,
+``.a`` alone: ``b``, ``c`` and ``d`` were lost.)

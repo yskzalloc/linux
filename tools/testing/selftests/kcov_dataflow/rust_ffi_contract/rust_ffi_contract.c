@@ -10,12 +10,19 @@
  * kcov_dataflow captures:
  *   [ENTRY] ffi_alloc_buf(alloc=0xffff..., 256, 16, 1)
  *   [RET]   ffi_alloc_buf() = 0
- *   [ENTRY] ffi_check_result(alloc=0xffff...)      the same object
+ *   [ENTRY] ffi_check_result(alloc=0xffff... -> {NULL, 0x110, 0, 0})
  *   [RET]   ffi_check_result() = -EFAULT
  *                             ^ success, then a NULL buffer: contract violated
  *
- * alloc is a pointer and is recorded as the address it holds; DWARF says it
- * points at a struct ffi_alloc, whose fields are not read.
+ * alloc is a pointer and is recorded as the address it holds. A plain C
+ * pointer says nothing about how much of what it points to may be read, so
+ * at ffi_alloc_buf() that is all: DWARF says it points at a struct
+ * ffi_alloc, whose fields are not read. ffi_check_result() declares the
+ * same parameter as an array of static size, "alloc[static 1]", which tells
+ * the compiler a whole struct ffi_alloc is there to read: its IR is then
+ * dereferenceable(24), and the kernel records the 24 bytes behind the
+ * pointer, which DWARF cuts into the members -- the NULL buffer that
+ * ffi_alloc_buf() claimed to have filled in is in the record itself.
  *
  * Write to /sys/kernel/debug/kcov_dataflow_test/rust_ffi_trigger to run.
  */
@@ -36,7 +43,7 @@ struct ffi_alloc {
 /* Prototypes */
 int ffi_alloc_buf(struct ffi_alloc *alloc, u64 data_size,
 		  u64 offsets_size, int is_async);
-int ffi_check_result(struct ffi_alloc *alloc);
+int ffi_check_result(struct ffi_alloc alloc[static 1]);
 
 /*
  * Callee with contract: returns 0 implies alloc->buffer is valid.
@@ -70,7 +77,7 @@ noinline int ffi_alloc_buf(struct ffi_alloc *alloc, u64 data_size,
 EXPORT_SYMBOL(ffi_alloc_buf);
 
 /* Caller that trusts the contract */
-noinline int ffi_check_result(struct ffi_alloc *alloc)
+noinline int ffi_check_result(struct ffi_alloc alloc[static 1])
 {
 	if (!alloc->buffer) {
 		pr_err("ffi_contract: VIOLATION detected - buffer is NULL after success\n");

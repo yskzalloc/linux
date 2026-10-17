@@ -35,15 +35,16 @@
  *                          descriptor and the DWARF the compiler emits for
  *                          that call, e.g. with "sancov -symbolize-dataflow" -
  *                          which IR argument, element and source parameter
- *     [2] ENTRY/RET: the address the field values were read from, and 0 when
- *                    the record carries the value itself (nvals == 1); an
- *                    address the callee received as NULL/ERR_PTR leaves the
- *                    value words holding KCOV_DF_MAGIC_BAD
+ *     [2] ENTRY/RET: the address the value words were read from, with
+ *                    KCOV_DF_HDR_MEM set, and 0 when the record carries the
+ *                    value itself (nvals == 1); an address the callee
+ *                    received as NULL/ERR_PTR leaves the value words holding
+ *                    KCOV_DF_MAGIC_BAD
  *         CMP:       comparison type, KCOV_CMP_SIZE()/KCOV_CMP_CONST bits
  *                    (linux/kcov.h)
  *     [3 .. 3 + nvals)     value words: the value itself (nvals == 1), the
- *                          fields of an object in memory, or the two CMP
- *                          operands (nvals == 2)
+ *                          words read at word [2] (KCOV_DF_HDR_MEM), or the
+ *                          two CMP operands (nvals == 2)
  *
  * What is recorded is the function's arguments as the compiler lowered them
  * (its IR arguments), not its source parameters: the argument index is the IR
@@ -52,16 +53,34 @@
  * recorded but keeps its position.
  *
  * A value - an integer, a pointer, a floating-point value - is recorded as it
- * comes, with word [2] zero; a pointer as the address it holds, its pointee is
- * never read. Only an object the ABI passes in memory (a byval argument) or
- * returns through a caller-provided buffer (sret) arrives as an address, which
- * word [2] keeps, and the fields the compiler describes are read out of it. An
- * object the function never uses, and a value with no fixed-size bit pattern,
- * are recorded with size 0 and KCOV_DF_MAGIC_BAD in their value words.
+ * comes, with word [2] zero; a pointer as the address it holds. Memory is read
+ * only where the compiler's IR says it may be, and then KCOV_DF_HDR_MEM is set,
+ * word [2] holds the address, and each value word holds up to 8 bytes read
+ * from it, in memory order from the word's lowest-addressed byte (the low
+ * bytes on a little-endian kernel), zero-filled:
+ *
+ *  - an object the ABI passes in memory (a byval argument) or returns through
+ *    a caller-provided buffer (sret): the fields of its IR type, a field wider
+ *    than 8 bytes, or an opaque byte array as rustc types such objects, in
+ *    8-byte pieces; size is the object's;
+ *  - a pointer argument or return value the IR says is dereferenceable(N)
+ *    (a Rust &T, a C++ reference, a C "T p[static 1]"; a plain C pointer is
+ *    not): word [2] is the pointer, and the value words are a raw snapshot of
+ *    the first min(N, CONFIG_KCOV_DATAFLOW_POINTEE_BYTES) bytes it points to,
+ *    8 at a time; size is the number of bytes. For dereferenceable_or_null
+ *    the pointer may be NULL.
+ *
+ * Which of the two a record is, and what the bytes are in source terms, is
+ * for the __sancov_dataflow descriptor of its pc and the DWARF of the binary to
+ * say ("sancov -symbolize-dataflow" cuts a snapshot into the pointee's
+ * members). An object the function never uses, and a value with no fixed-size
+ * bit pattern, are recorded with size 0 and KCOV_DF_MAGIC_BAD in their value
+ * words.
  *
  * The header packs:
  *
  *   bits  0..23  per-task record sequence number
+ *   bit  24      KCOV_DF_HDR_MEM: the value words were read at word [2]
  *   bits 28..31  record type, KCOV_DF_TYPE_*
  *   bits 32..47  nvals, the number of value words that follow word [2]
  *   bits 48..55  ENTRY/RET: size in bytes of the traced argument/return value
@@ -86,6 +105,7 @@
 #define KCOV_DF_TYPE_RET	0xF
 
 #define KCOV_DF_HDR_SEQ_MASK	0x00FFFFFFULL
+#define KCOV_DF_HDR_MEM		(1ULL << 24)
 #define KCOV_DF_HDR_TYPE_SHIFT	28
 #define KCOV_DF_HDR_TYPE_MASK	0xFULL
 #define KCOV_DF_HDR_NVALS_SHIFT	32
