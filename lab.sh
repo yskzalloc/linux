@@ -9,6 +9,14 @@
 #   bash lab.sh rust-local    # Rust driver (same /dev node), in the VM
 #   bash lab.sh rust-remote   # Rust workqueue driver, REMOTE KCOV, in the VM
 #
+# FuzzTest labs (Part 4 of the book; harnesses in tools/harden/fuzztest/):
+#   bash lab.sh fuzztest-build      # bazel build all FuzzTest harnesses
+#   bash lab.sh fuzztest-userspace  # FuzzTest warm-up, no VM
+#   bash lab.sh fuzztest-local      # Harden.LocalCommands vs harden_local.ko
+#   bash lab.sh fuzztest-remote     # Harden.RemoteCommands vs harden_remote.ko
+#   bash lab.sh fuzztest-raw        # Harden.RawPage (bytes, like libFuzzer)
+#   bash lab.sh fuzztest-ledger     # model-based property vs harden_ledger.ko
+#
 # Run `build` once; then each lab boots virtme-ng, loads the buggy module, and
 # fuzzes it until the planted out-of-bounds write trips KASAN and the guest
 # panics — which is how the crash is reported across the syscall boundary.
@@ -30,8 +38,13 @@ FUZZ_FLAGS="-g -O1 -fsanitize=fuzzer,address"
 
 usage() {
 	echo "usage: bash lab.sh {build|userspace|local|remote|rust-local|rust-remote}" >&2
+	echo "       bash lab.sh {fuzztest-build|fuzztest-userspace|fuzztest-local|" >&2
+	echo "                    fuzztest-remote|fuzztest-raw|fuzztest-ledger}" >&2
 	echo "  env: RUNS=N  TIME=S(userspace)  HARDEN_CMP=1(compare-feedback)" >&2
 	echo "       JOBS=N  NO_RUST=1  VENV=path   (build)" >&2
+	echo "       FUZZ_FOR=5m  ENGINE=centipede|legacy  KASAN_FAULT=report|panic" >&2
+	echo "       TEST=Suite.Name (fuzztest-userspace)  REPLAY=file    (fuzztest-*)" >&2
+	echo "       HARDEN_NO_FEATURES=1 (hide KCOV from the engine)  CORPUS_DB=dir" >&2
 	exit 2
 }
 
@@ -97,24 +110,39 @@ build_kernel() {
 		fi
 	fi
 
-	vng --build -j "$jobs" LLVM=1 \
-		--configitem CONFIG_KASAN=y \
-		--configitem CONFIG_KASAN_GENERIC=y \
-		--configitem CONFIG_KASAN_STACK=n \
-		--configitem CONFIG_FRAME_WARN=4096 \
-		--configitem CONFIG_PANIC_ON_OOPS=y \
-		--configitem CONFIG_KCOV=y \
-		--configitem CONFIG_KCOV_ENABLE_COMPARISONS=y \
-		--configitem CONFIG_DEBUG_FS=y \
-		--configitem CONFIG_SAMPLES=y \
-		--configitem CONFIG_SAMPLE_HARDEN=m \
+	local items=(
+		--configitem CONFIG_KASAN=y
+		--configitem CONFIG_KASAN_GENERIC=y
+		--configitem CONFIG_KASAN_STACK=n
+		--configitem CONFIG_FRAME_WARN=4096
+		--configitem CONFIG_PANIC_ON_OOPS=y
+		--configitem CONFIG_KCOV=y
+		--configitem CONFIG_KCOV_ENABLE_COMPARISONS=y
+		--configitem CONFIG_DEBUG_FS=y
+		--configitem CONFIG_SAMPLES=y
+		--configitem CONFIG_SAMPLE_HARDEN=m
 		"${rust_items[@]}"
+	)
+
+	# Step 1: (re)generate .config. `vng --build` alone passes --no-update to
+	# virtme-configkernel when a .config already exists, so on a tree that
+	# was built before the --configitem list is silently IGNORED (and the
+	# sample modules never get built). `vng --kconfig` always rewrites it.
+	vng --kconfig LLVM=1 "${items[@]}"
+	if ! grep -q '^CONFIG_SAMPLE_HARDEN=m' .config; then
+		echo "lab.sh: CONFIG_SAMPLE_HARDEN=m did not stick in .config" >&2
+		exit 1
+	fi
+
+	# Step 2: build the kernel and the modules.
+	vng --build -j "$jobs" LLVM=1 "${items[@]}"
 
 	echo
 	echo "[harden] build finished; artifacts the labs need:"
 	local ko
 	for ko in samples/harden/harden_local.ko \
 	          samples/harden/harden_remote.ko \
+	          samples/harden/harden_ledger.ko \
 	          samples/rust/harden/local.ko \
 	          samples/rust/harden/remote.ko; do
 		if [ -e "$ko" ]; then printf '  %-40s ok\n' "$ko"
@@ -131,6 +159,7 @@ build_kernel() {
 	fi
 	echo
 	echo "[harden] next: bash lab.sh {userspace|local|remote|rust-local|rust-remote}"
+	echo "         or:   bash lab.sh fuzztest-build, then fuzztest-{userspace|local|remote|raw|ledger}"
 }
 
 # Boot the built kernel and run a command string in the guest. virtme shares the
@@ -151,8 +180,17 @@ run_in_guest() {
 	# kasan.fault=panic: make a KASAN report fatal. NOTE: CONFIG_PANIC_ON_OOPS
 	# alone does NOT catch KASAN reports (they are not "oops"), so without this
 	# the fuzzer would keep running past the bug instead of stopping on it.
-	vng --verbose --user root --rw \
-		--append "nokaslr kasan.fault=panic" --exec "$1"
+	#
+	# KASAN_FAULT=report (the FuzzTest labs' default) keeps the kernel alive
+	# after a report so the harness can turn the KASAN taint bit into a
+	# property failure, and FuzzTest/Centipede report it themselves.
+	#
+	# --memory: virtme-ng's default guest RAM is too small for a FuzzTest
+	# Centipede binary (ASan shadow + the controller/runner shared-memory
+	# blobs); the first large mmap fails and the runner segfaults.
+	vng --verbose --user root --rw --memory "${VM_MEMORY:-4G}" \
+		--append "nokaslr kasan.fault=${KASAN_FAULT:-panic} ${KASAN_EXTRA:-}" \
+		--exec "$1"
 }
 
 # Print a module's .text load base (needs kptr_restrict=0). Handy for turning a
@@ -196,6 +234,101 @@ kernel_lab() {
 	fi
 }
 
+# ---------------------------------------------------------------------------
+# FuzzTest labs. The harnesses are a Bazel workspace (FuzzTest's Centipede
+# engine is only wired up in Bazel), pinned to the FuzzTest commit the book
+# studies. ENGINE=centipede (default) is --config=fuzztest-experimental: the
+# only engine that reads the __centipede_extra_features array, i.e. the only
+# one that SEES kernel coverage. ENGINE=legacy builds --config=fuzztest, the
+# in-process engine, which still runs the harness but is blind to the kernel.
+FT_DIR="$ROOT/tools/harden/fuzztest"
+FT_ENGINE="${ENGINE:-centipede}"
+FT_OUT="$FT_DIR/out-$FT_ENGINE"
+
+fuzztest_build() {
+	command -v bazel >/dev/null 2>&1 || {
+		echo "lab.sh: bazel not found. Install bazelisk as 'bazel', e.g.:" >&2
+		echo "    curl -fsSLo ~/.local/bin/bazel https://github.com/bazelbuild/bazelisk/releases/download/v1.26.0/bazelisk-linux-amd64 && chmod +x ~/.local/bin/bazel" >&2
+		exit 1
+	}
+	local config
+	case "$FT_ENGINE" in
+	centipede) config="--config=fuzztest-experimental --config=asan" ;;
+	legacy)    config="--config=fuzztest" ;;
+	*) echo "lab.sh: ENGINE must be centipede or legacy" >&2; exit 2 ;;
+	esac
+	cd "$FT_DIR"
+	[ -s fuzztest.bazelrc ] ||
+		bazel run @com_google_fuzztest//bazel:setup_configs > fuzztest.bazelrc
+	# shellcheck disable=SC2086
+	bazel build $config :all
+	# Copy out of bazel-bin: the binaries then survive the next build with a
+	# different ENGINE, and the guest sees a plain path.
+	mkdir -p "$FT_OUT"
+	local t
+	for t in userspace_fuzztest harden_fuzztest ledger_fuzztest; do
+		install -m 0755 "bazel-bin/$t" "$FT_OUT/$t"
+	done
+	echo "[harden] FuzzTest ($FT_ENGINE) harnesses in $FT_OUT"
+	cd "$ROOT"
+}
+
+ft_binary() {
+	local b="$FT_OUT/$1"
+	[ -x "$b" ] || {
+		echo "error: $b not found — run: ENGINE=$FT_ENGINE bash lab.sh fuzztest-build" >&2
+		exit 1
+	}
+	echo "$b"
+}
+
+# Boot the guest, load a module, run one FuzzTest property in fuzzing mode.
+# Findings land in a corpus database on the HOST (via vng --rw), so they
+# survive the VM: <db>/<binary>/workdir.000/<test>/crashes.000000/<sha1>.
+# REPLAY=<that file> re-runs one finding in a fresh guest instead of fuzzing.
+fuzztest_kernel_lab() {
+	local ko="$1" bin="$2" test="$3"
+	if [ ! -e "$ko" ]; then
+		echo "error: $ko not found — build the kernel first: bash lab.sh build" >&2
+		exit 1
+	fi
+	local mod; mod="$(basename "${ko%.ko}")"
+	local db="${CORPUS_DB:-$FT_DIR/corpus-db}"
+	local repro="$ROOT/tools/harden/repro-$mod-fuzztest.bin"
+	mkdir -p "$db"
+	rm -f "$repro"
+	local run
+	if [ -n "${REPLAY:-}" ]; then
+		# Replay mode: the unit-test runner with one input, no engine loop.
+		run="FUZZTEST_REPLAY='$REPLAY' '$bin' --gtest_filter='$test'"
+	else
+		run="HARDEN_REPRO='$repro' ${HARDEN_TRACE:+HARDEN_TRACE=1 }${HARDEN_NO_FEATURES:+HARDEN_NO_FEATURES=1 }'$bin' \
+			--fuzz='$test' --fuzz_for='${FUZZ_FOR:-5m}' \
+			--corpus_database='$db'"
+	fi
+	# kasan_multi_shot: report EVERY hit, not just the first since boot, so
+	# the harness's /dev/kmsg oracle fires again when Centipede re-runs the
+	# input to confirm it (with one-shot KASAN the re-run looks clean).
+	KASAN_FAULT="${KASAN_FAULT:-report}" KASAN_EXTRA="kasan_multi_shot" run_in_guest \
+		"mount -t debugfs none /sys/kernel/debug 2>/dev/null; \
+		sysctl -w kernel.kptr_restrict=0 >/dev/null; \
+		insmod '$ko' && echo '[harden] loaded $(basename "$ko")'; \
+		echo \"[harden] $mod .text base: \$(cat /sys/module/$mod/sections/.text 2>/dev/null)\"; \
+		cd '$FT_DIR'; \
+		$run; \
+		echo \"[harden] fuzzer exit status: \$?\"; \
+		echo \"[harden] kernel taint: \$(cat /proc/sys/kernel/tainted)\"; \
+		dmesg | grep -A3 'BUG: KASAN' | head -8" \
+		|| echo "[harden] guest exited (with KASAN_FAULT=panic a finding ends the VM)"
+	if [ -s "$repro" ]; then
+		echo "[harden] last input in flight: $repro ($(stat -c%s "$repro") bytes)"
+		od -An -tx1 "$repro" | head -2
+	fi
+	echo "[harden] corpus database: $db"
+	find "$db" -path "*/${test}/crashes.*" -type f 2>/dev/null | head -5 |
+		sed 's/^/  crash: /'
+}
+
 PRACTICE="${1:-}"
 [ -n "$PRACTICE" ] || usage
 
@@ -235,6 +368,34 @@ rust-remote)
 	fz=/tmp/harden_remote_fuzz
 	"$CLANG" $FUZZ_FLAGS "$ROOT/tools/harden/sample/remote.c" -o "$fz"
 	kernel_lab "$ROOT/samples/rust/harden/remote.ko" "$fz"
+	;;
+fuzztest-build)
+	fuzztest_build
+	;;
+fuzztest-userspace)
+	# No VM. Without TEST=..., runs the three Userspace.* properties in turn.
+	bin="$(ft_binary userspace_fuzztest)"
+	for t in ${TEST:-Userspace.Bytes Userspace.Typed Userspace.RoundTrip}; do
+		echo "[harden] === $t ($FT_ENGINE engine)"
+		"$bin" --fuzz="$t" --fuzz_for="${FUZZ_FOR:-60s}" \
+			--corpus_database="$FT_DIR/corpus-db" || true
+	done
+	;;
+fuzztest-local)
+	fuzztest_kernel_lab "$ROOT/samples/harden/harden_local.ko" \
+		"$(ft_binary harden_fuzztest)" Harden.LocalCommands
+	;;
+fuzztest-raw)
+	fuzztest_kernel_lab "$ROOT/samples/harden/harden_local.ko" \
+		"$(ft_binary harden_fuzztest)" Harden.RawPage
+	;;
+fuzztest-remote)
+	fuzztest_kernel_lab "$ROOT/samples/harden/harden_remote.ko" \
+		"$(ft_binary harden_fuzztest)" Harden.RemoteCommands
+	;;
+fuzztest-ledger)
+	fuzztest_kernel_lab "$ROOT/samples/harden/harden_ledger.ko" \
+		"$(ft_binary ledger_fuzztest)" HardenLedger.KernelMatchesModel
 	;;
 *)
 	usage

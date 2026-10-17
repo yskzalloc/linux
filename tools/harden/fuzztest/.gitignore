@@ -1,0 +1,5 @@
+/bazel-*
+/fuzztest.bazelrc
+/MODULE.bazel.lock
+/out-*
+/corpus-db

@@ -6,6 +6,8 @@
 
 obj-$(CONFIG_SAMPLE_HARDEN) += harden_local.o
 obj-$(CONFIG_SAMPLE_HARDEN) += harden_remote.o
+obj-$(CONFIG_SAMPLE_HARDEN) += harden_ledger.o
 
 harden_local-y  := local.o
 harden_remote-y := remote.o
+harden_ledger-y := ledger.o

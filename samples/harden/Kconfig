@@ -3,16 +3,21 @@ config SAMPLE_HARDEN
 	tristate "Buggy KCOV/KASAN hardening demo drivers"
 	depends on KCOV && m
 	help
-	  Build two deliberately buggy misc-device drivers used by the
-	  "KCOV + libFuzzer + KASAN" hands-on hardening tutorial:
+	  Build three deliberately buggy misc-device drivers used by the
+	  "KCOV + libFuzzer/FuzzTest + KASAN" hands-on hardening tutorial:
 
 	    harden_local  - parses a zero-copy shared page in syscall context
 	                    (local KCOV coverage).
 	    harden_remote - parses the same page on a workqueue kthread
 	                    (remote KCOV coverage, KCOV_REMOTE_ENABLE).
 
-	  Both contain a write-side out-of-bounds bug behind an under-covered
-	  branch, intended to be found by the userspace libFuzzer harnesses in
-	  tools/harden/sample/. Do NOT enable on a production kernel.
+	    harden_ledger - a per-file memory quota whose accounting drifts
+	                    after ALLOC/RESIZE/FREE (a logic bug KASAN cannot
+	                    see; found by a FuzzTest model-based property).
+
+	  The first two contain a write-side out-of-bounds bug behind an
+	  under-covered branch, intended to be found by the userspace libFuzzer
+	  harnesses in tools/harden/sample/ or the FuzzTest harnesses in
+	  tools/harden/fuzztest/. Do NOT enable on a production kernel.
 
 	  If unsure, say N.

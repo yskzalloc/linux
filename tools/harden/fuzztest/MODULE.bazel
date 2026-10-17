@@ -1,0 +1,20 @@
+# tools/harden/fuzztest — FuzzTest harnesses for the samples/harden drivers.
+#
+# FuzzTest is pinned to the exact commit the book studies (Part 3), so the
+# engine internals quoted there match what you build here.
+
+module(name = "harden_fuzztest")
+
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "fuzztest", repo_name = "com_google_fuzztest")
+git_override(
+    module_name = "fuzztest",
+    commit = "ed1ae14a62f96483411068253a2d080c389bf8b0",
+    remote = "https://github.com/google/fuzztest.git",
+)
+bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
+
+# FuzzTest's own MODULE.bazel pins these two; overrides in a non-root module
+# are ignored, so the root module has to repeat them.
+single_version_override(module_name = "rules_foreign_cc", version = "0.15.1")
+single_version_override(module_name = "aspect_bazel_lib", version = "2.22.5")
