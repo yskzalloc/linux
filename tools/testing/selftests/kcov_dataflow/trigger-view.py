@@ -32,7 +32,9 @@ instead, keeping their order, kind and repeats, and --accesses=none hides
 them. They are never shown as argument values: an access is not what the
 pointee held at the call.
 
-When sancov is found (--sancov, $SANCOV or PATH), every module record is
+When a sancov that resolves records is found (--sancov, $SANCOV or PATH; one
+without -symbolize-dataflow, or whose -symbolize-dataflow does not read the
+descriptors, is ignored -- see sancov_has_dataflow()), every module record is
 also resolved through "sancov -symbolize-dataflow", which joins the
 __sancov_dataflow descriptor and the DWARF the compiler emitted for each call:
 values are shown under the source parameter they hold, a struct the ABI
@@ -57,6 +59,7 @@ import ctypes.util
 import argparse
 import fcntl
 import json
+import mmap
 import platform
 import subprocess
 import shutil
@@ -672,11 +675,50 @@ def run_capture(ko_path, remote=False, vmlinux=None, kaslr_override=None,
         os.close(df_fd)
 
 
+def sancov_has_dataflow(sancov):
+    """
+    Whether @sancov resolves records to source names: it has
+    -symbolize-dataflow, and that action reads the __sancov_dataflow
+    descriptors SourceMap needs (IR argument, section, DWARF parameter and
+    members).
+
+    Two sancovs fall short and are rejected, so their records are shown by
+    IR argument instead:
+      - upstream sancov, shipped by a toolchain that only carries the
+        instrumentation, the clang flag and the compiler-rt callbacks: it has
+        no -symbolize-dataflow at all;
+      - a sancov whose -symbolize-dataflow only locates the callback call
+        sites by disassembly ({pc, kind, frames}). It finds no call site in a
+        module -- a .ko is relocatable, the callbacks are undefined symbols
+        and each call's target is a relocation -- and reports no descriptor
+        or section to key a point by even where it finds them.
+    The second has the same -help as a sancov that reads the descriptors, so
+    it is told apart by whether the binary knows the descriptor section's
+    name at all.
+    """
+    try:
+        r = subprocess.run([sancov, "-help"], capture_output=True, text=True,
+                           timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if "-symbolize-dataflow" not in r.stdout + r.stderr:
+        return False
+    try:
+        with open(sancov, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                return m.find(b"__sancov_dataflow") != -1
+    except (OSError, ValueError):
+        return False
+
+
 def find_sancov(path=None):
-    """sancov binary: explicit path, $SANCOV, or PATH; None if not found."""
+    """
+    sancov binary: explicit path, $SANCOV, or PATH; None if not found, or if
+    the one found cannot resolve records (see sancov_has_dataflow()).
+    """
     for cand in (path, os.environ.get("SANCOV"), shutil.which("sancov")):
         if cand and os.access(cand, os.X_OK):
-            return cand
+            return cand if sancov_has_dataflow(cand) else None
     return None
 
 
