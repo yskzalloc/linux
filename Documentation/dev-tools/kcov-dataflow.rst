@@ -235,6 +235,58 @@ with or without debug information:
   object in memory, it is not read -- callers may pass anything for it --
   and is recorded with size 0.
 
+Pointee snapshots and access records
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+There are two ways the bytes behind a pointer argument are recorded, and
+they mean different things:
+
+- A **pointee snapshot** (ENTRY or RET record, ``KCOV_DF_HDR_MEM``) is read
+  by the collector at the trace point -- function entry, or the return --
+  because the compiler's IR has an explicit contract that the bytes may be
+  read there (``dereferenceable(N)``). It is the first N bytes of the
+  pointee as they were at that moment.
+- An **access record** (``KCOV_DF_TYPE_ACCESS``, with
+  ``CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS``) is the value of one load or store
+  the function itself made through a pointer argument, at a constant offset
+  from it (``p->field``, ``p->a.b[2]``, ``container_of(p, ...)->field``),
+  recorded right after the access when the access executed. Word 3 is the
+  value the load returned or the store wrote, the header size its bytes, the
+  header argidx the pointer argument, and word 2 the kind:
+  ``KCOV_DF_ACCESS_STORE`` (else a load), ``KCOV_DF_ACCESS_VOLATILE``,
+  ``KCOV_DF_ACCESS_ATOMIC``. The value is the program's own: the collector
+  reads nothing, and the compiler adds no load, so KASAN and KCSAN see the
+  same accesses with and without the option. Which bytes of the pointee the
+  access covered is in the record's ``__sancov_dataflow`` descriptor (a
+  signed offset; a value wider than 8 bytes is several records, one per
+  8-byte piece).
+
+An access record is not a snapshot of the pointee. It covers only the bytes
+the function accessed, and says nothing of the members it did not touch; it
+is the value at the time of the access, which may be after locks were taken
+or other calls changed the pointee, not the value at the call; one member
+may have many records, one per executed access, in execution order; and a
+store record does not say the value was still in memory afterwards. Records
+are emitted in the middle of a function, after any records of the functions
+it called before the access: a consumer attributes them to the innermost
+active frame of the function whose call site they carry (see
+``trigger-view.py``).
+
+Not recorded: accesses through a pointer loaded from memory, at a variable
+offset, or rebuilt from an integer; ``memcpy()``/``memset()``; read-modify-
+write and compare-exchange operations; inline assembly, which is how the
+kernel implements its atomics, ``get_user()``/``put_user()`` and MMIO
+accessors. Volatile accesses (``READ_ONCE()``/``WRITE_ONCE()``) need
+``CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS_VOLATILE``, and the compiler's own atomic
+loads and stores ``CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS_ATOMIC``. Nothing is ever
+read to stand in for an access that is not recorded.
+
+Compatibility: ACCESS records exist only when the kernel is built with
+``CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS``; a decoder walking records by
+``KCOV_DF_RECORD_WORDS(nvals)`` skips a record type it does not know, so an
+older decoder loses the access records but misreads nothing. Without the
+option the record stream is unchanged.
+
 Magic values:
 
 - ``0xBADADD85``: a field read failed (the address was invalid, freed or
@@ -248,7 +300,8 @@ Safety
 - Callbacks are ``notrace``, ``__no_sanitize_coverage``, ``noinline``
   to prevent recursion.
 - Only reading an object passed or returned in memory, or the bytes behind
-  a pointer the IR says are dereferenceable, touches memory, and it does so
+  a pointer the IR says are dereferenceable, touches memory -- never an
+  ACCESS record, whose value arrives in a register -- and it does so
   with
   ``copy_from_kernel_nofault()`` -- surviving freed, poisoned or unmapped
   memory. A value that arrives in a register cannot fault at all.
@@ -490,7 +543,14 @@ Pointer arguments
     has a ``dereferenceable`` attribute; of those of ``rust/kernel.o`` and
     the Rust binder driver, 42%. For the rest, the pointee's type and field
     layout are available offline from DWARF (``sancov -symbolize-dataflow``
-    reports them as ``pointee``, with ``bytes_read`` 0), its values are not.
+    reports them as ``pointee``, with ``bytes_read`` 0), its values are not
+    -- except, with ``CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS``, the values the
+    function itself loads and stores through it, as access records. Measured
+    statically on the same objects, at least one pointee byte of 51% of the C
+    pointer arguments of an x86_64 build is then recorded (54% with the
+    volatile and atomic options), 55% (58%) on arm64, and, with snapshots,
+    55% of the Rust ones: shares of pointer arguments with any recorded
+    pointee byte, not of arguments or structs reconstructed.
 
 Struct-by-value in registers
     A small struct passed or returned by value has no address once the ABI
@@ -531,6 +591,8 @@ read in memory, and the pointee type and fields of a pointer -- with
 ``bytes_read``, the size of the snapshot, and which of the fields it holds
 wholly, in part (``"complete": false``) or not at all (``"observed":
 false``), so that a consumer can cut the value words of a snapshot record
-into members by their ``bit_offset``. A record is
+into members by their ``bit_offset``. An access record's call site is
+``"kind": "access"``, and lists the members of the pointee its bytes overlap,
+with a source expression (``o->in.x``) and where in the value each is. A record is
 looked up by its ``pc`` (for a module, relative to the module's ``.text``):
 the address ``sancov`` reports for a call is the one the kernel records.

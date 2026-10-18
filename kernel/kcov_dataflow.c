@@ -442,14 +442,15 @@ kcov_df_hdr(u64 type, u32 nvals, u32 size, u32 arg_idx, u32 seq, bool mem)
  * Core write function for ENTRY/RET records.
  * Uses the same READ_ONCE/WRITE_ONCE pattern as write_comp_data() in kcov.c.
  *
- * @num_fields says what @val is. Zero means @val is the traced value itself,
+ * @offsets says what @val is. NULL means @val is the traced value itself,
  * @size bytes of it, and it is recorded as it comes -- no memory is touched.
- * Non-zero means @val is the address of @size bytes and @offsets is the
- * compiler-supplied table of that many (offset, size) pairs to read out of
- * them, none wider than a word; it is clamped to KCOV_DF_MAX_VALS so the record
- * length can never wrap and the field loop is bounded by the words actually
- * reserved. The bytes are an object the ABI passed or returned in memory, or
- * the first bytes a pointer points to that the IR says are dereferenceable
+ * Otherwise @val is the address of @size bytes and @offsets the
+ * compiler-supplied table of what to read out of them: its first word is the
+ * number of (offset, size) pairs that follow, none wider than a word. The
+ * number is clamped to KCOV_DF_MAX_VALS so the record length can never wrap
+ * and the field loop is bounded by the words actually reserved. The bytes are
+ * an object the ABI passed or returned in memory, or the first bytes a
+ * pointer points to that the IR says are dereferenceable
  * (a raw snapshot, bounded by CONFIG_KCOV_DATAFLOW_POINTEE_BYTES); the
  * record is the same either way, and the __sancov_dataflow descriptor of
  * the pc tells them apart. A dereferenceable_or_null pointer may be NULL.
@@ -457,15 +458,20 @@ kcov_df_hdr(u64 type, u32 nvals, u32 size, u32 arg_idx, u32 seq, bool mem)
  * no fixed-size bit pattern, or an in-memory object the function never uses,
  * whose caller may pass anything (dead argument elimination hands it poison)
  * -- so it is not read.
+ *
+ * @word2 is word [2] of a record that carries its value itself: 0 for
+ * ENTRY/RET, the access kind for an ACCESS record, whose @val is a value the
+ * instrumented code loaded or stored and whose @offsets is always NULL -- no
+ * ACCESS record ever makes this read memory.
  */
 static noinline notrace __no_sanitize_coverage void
 kcov_df_write(u64 type, u64 pc, u32 arg_idx, u32 size, u64 val,
-	      u64 *offsets, u32 num_fields)
+	      const u64 *offsets, u64 word2)
 {
 	struct task_struct *t = current;
 	u64 *area;
 	unsigned long start_index;
-	u32 nvals, seq, i;
+	u32 num_fields = 0, nvals, seq, i;
 
 	if (kcov_df_inert_context())
 		return;
@@ -488,8 +494,21 @@ kcov_df_write(u64 type, u64 pc, u32 arg_idx, u32 size, u64 val,
 	if (!area)
 		goto out;
 
-	if (num_fields > KCOV_DF_MAX_VALS)
-		num_fields = KCOV_DF_MAX_VALS;
+	/*
+	 * The table is a constant the compiler emitted into the instrumented
+	 * object, but it is read like the pairs that follow, by a nofault copy
+	 * under the guard: a corrupt pointer costs a record, not the kernel. If
+	 * even the count cannot be read, the record keeps one field, which the
+	 * loop below fails to read and marks KCOV_DF_MAGIC_BAD.
+	 */
+	if (offsets) {
+		u64 n;
+
+		if (copy_from_kernel_nofault(&n, offsets, sizeof(n)))
+			n = 1;
+		num_fields = min_t(u64, n, KCOV_DF_MAX_VALS);
+		offsets++;
+	}
 	/* Record: header + pc + address, then the fields or one value word. */
 	nvals = num_fields > 0 ? num_fields : 1;
 
@@ -501,10 +520,11 @@ kcov_df_write(u64 type, u64 pc, u32 arg_idx, u32 size, u64 val,
 					num_fields != 0);
 	area[start_index + 1] = kcov_df_canonicalize_ip(pc);
 	/*
-	 * Word [2] is the address the field values were read from, and zero for
-	 * a record that carries the value itself: there is no object behind it.
+	 * Word [2] is the address the field values were read from, or, for a
+	 * record that carries the value itself, @word2: zero for ENTRY/RET, as
+	 * there is no object behind it, and the access kind for ACCESS.
 	 */
-	area[start_index + 2] = num_fields ? val : 0;
+	area[start_index + 2] = num_fields ? val : word2;
 
 	if (num_fields == 0) {
 		/*
@@ -571,9 +591,16 @@ out:
  * protection in force while the collector runs. It compiles to nothing on
  * architectures without the feature.
  *
- * @val is the traced value itself, or, when @num_fields is non-zero, the address
- * of the bytes @offsets describes: an object, or what a pointer points to. See
- * kcov_df_write().
+ * The compiler's interface (clang/docs/SanitizerCoverage.md) has no
+ * sub-register integer, so no target relies on the caller extending one:
+ *
+ *   void __sanitizer_cov_trace_args(u64 tag, u64 val, const u64 *offsets);
+ *   void __sanitizer_cov_trace_ret(u64 size, u64 val, const u64 *offsets);
+ *
+ * @tag is (arg_idx << 32) | size. @val is the traced value itself when
+ * @offsets is NULL; otherwise it is the address of the bytes the table at
+ * @offsets describes -- an object, or what a pointer points to -- whose first
+ * word is the number of (offset, size) pairs that follow. See kcov_df_write().
  *
  * Neither callback is told which function it speaks for: the instrumented
  * location is the return address, as it is for the __sanitizer_cov_trace_cmp*()
@@ -589,19 +616,36 @@ out:
  */
 #define KCOV_DF_CALL_SITE(ret_ip)	((ret_ip) - 1)
 
+/*
+ * The arg_idx of a trace-args call the compiler emits for a load or store
+ * through a pointer argument (-sanitizer-coverage-trace-pointee-access):
+ * bit 31 set, the access kind in bits 16..23, the IR argument in bits 0..15.
+ * @val is the loaded or stored value itself and @offsets is NULL: there is
+ * nothing to read, and kcov_df_write() is passed no table either way.
+ */
+#define KCOV_DF_TAG_ARG_IDX(tag)	((u32)((tag) >> 32))
+#define KCOV_DF_TAG_SIZE(tag)		((u32)(tag))
+#define KCOV_DF_ARG_ACCESS		(1U << 31)
+#define KCOV_DF_ARG_ACCESS_KIND(a)	(((a) >> 16) & 0xFF)
+#define KCOV_DF_ARG_INDEX(a)		((a) & 0xFFFF)
+
 #ifdef CONFIG_KCOV_DATAFLOW_ARGS
 noinline void notrace __no_sanitize_coverage
-__sanitizer_cov_trace_args(u32 arg_idx, u32 arg_size, u64 val,
-			   u64 *offsets, u32 num_fields);
+__sanitizer_cov_trace_args(u64 tag, u64 val, const u64 *offsets);
 
 noinline void notrace __no_sanitize_coverage
-__sanitizer_cov_trace_args(u32 arg_idx, u32 arg_size, u64 val,
-			   u64 *offsets, u32 num_fields)
+__sanitizer_cov_trace_args(u64 tag, u64 val, const u64 *offsets)
 {
 	unsigned long ua_flags = user_access_save();
+	u32 arg_idx = KCOV_DF_TAG_ARG_IDX(tag), size = KCOV_DF_TAG_SIZE(tag);
 
-	kcov_df_write(KCOV_DF_TYPE_ENTRY, KCOV_DF_CALL_SITE(_RET_IP_), arg_idx,
-		      arg_size, val, offsets, num_fields);
+	if (arg_idx & KCOV_DF_ARG_ACCESS)
+		kcov_df_write(KCOV_DF_TYPE_ACCESS, KCOV_DF_CALL_SITE(_RET_IP_),
+			      KCOV_DF_ARG_INDEX(arg_idx), size, val, NULL,
+			      KCOV_DF_ARG_ACCESS_KIND(arg_idx));
+	else
+		kcov_df_write(KCOV_DF_TYPE_ENTRY, KCOV_DF_CALL_SITE(_RET_IP_),
+			      arg_idx, size, val, offsets, 0);
 	user_access_restore(ua_flags);
 }
 EXPORT_SYMBOL(__sanitizer_cov_trace_args);
@@ -609,17 +653,15 @@ EXPORT_SYMBOL(__sanitizer_cov_trace_args);
 
 #ifdef CONFIG_KCOV_DATAFLOW_RET
 noinline void notrace __no_sanitize_coverage
-__sanitizer_cov_trace_ret(u32 ret_size, u64 val,
-			  u64 *offsets, u32 num_fields);
+__sanitizer_cov_trace_ret(u64 size, u64 val, const u64 *offsets);
 
 noinline void notrace __no_sanitize_coverage
-__sanitizer_cov_trace_ret(u32 ret_size, u64 val,
-			  u64 *offsets, u32 num_fields)
+__sanitizer_cov_trace_ret(u64 size, u64 val, const u64 *offsets)
 {
 	unsigned long ua_flags = user_access_save();
 
 	kcov_df_write(KCOV_DF_TYPE_RET, KCOV_DF_CALL_SITE(_RET_IP_), 0,
-		      ret_size, val, offsets, num_fields);
+		      min_t(u64, size, U32_MAX), val, offsets, 0);
 	user_access_restore(ua_flags);
 }
 EXPORT_SYMBOL(__sanitizer_cov_trace_ret);
