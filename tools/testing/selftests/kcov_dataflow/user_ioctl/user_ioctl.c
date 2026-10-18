@@ -140,7 +140,8 @@ TEST_F(kcov_dataflow, records_captured)
 	/*
 	 * With INSTRUMENT_ALL, getpid() produces records; without it count may
 	 * be 0. Whatever was written must parse: known types (CMP records are
-	 * interleaved with CONFIG_KCOV_ENABLE_COMPARISONS=y), at least one value
+	 * interleaved with CONFIG_KCOV_ENABLE_COMPARISONS=y, ACCESS records with
+	 * CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS=y), at least one value
 	 * word each, and a walk that ends exactly at area[0] inside the buffer.
 	 */
 	ASSERT_LE(count, (uint64_t)BUF_SIZE - 1);
@@ -154,8 +155,14 @@ TEST_F(kcov_dataflow, records_captured)
 			unsigned int nvals = KCOV_DF_HDR_NVALS(hdr);
 
 			ASSERT_TRUE(type == DF_TYPE_ENTRY || type == DF_TYPE_RET ||
-				    type == KCOV_DF_TYPE_CMP);
+				    type == KCOV_DF_TYPE_CMP ||
+				    type == KCOV_DF_TYPE_ACCESS);
 			ASSERT_GE(nvals, 1);
+			/* An access value is never read from memory. */
+			if (type == KCOV_DF_TYPE_ACCESS) {
+				ASSERT_EQ(nvals, 1);
+				ASSERT_EQ(hdr & KCOV_DF_HDR_MEM, 0);
+			}
 			if (type != KCOV_DF_TYPE_CMP)
 				nargs++;
 			pos += KCOV_DF_RECORD_WORDS(nvals);

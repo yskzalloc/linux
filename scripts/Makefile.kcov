@@ -36,6 +36,15 @@ kcov-dataflow-flags-y += -mllvm -sanitizer-coverage-trace-pointee-bytes=$(CONFIG
 kcov-dataflow-rflags-y += -Cllvm-args=-sanitizer-coverage-trace-pointee-bytes=$(CONFIG_KCOV_DATAFLOW_POINTEE_BYTES)
 endif
 
+# The values of the loads and stores instrumented functions make through their
+# pointer arguments, as KCOV_DF_TYPE_ACCESS records (trace-args calls).
+kcov-dataflow-flags-$(CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS) += -mllvm -sanitizer-coverage-trace-pointee-access
+kcov-dataflow-rflags-$(CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS) += -Cllvm-args=-sanitizer-coverage-trace-pointee-access
+kcov-dataflow-flags-$(CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS_VOLATILE) += -mllvm -sanitizer-coverage-trace-pointee-access-volatile
+kcov-dataflow-rflags-$(CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS_VOLATILE) += -Cllvm-args=-sanitizer-coverage-trace-pointee-access-volatile
+kcov-dataflow-flags-$(CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS_ATOMIC) += -mllvm -sanitizer-coverage-trace-pointee-access-atomic
+kcov-dataflow-rflags-$(CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS_ATOMIC) += -Cllvm-args=-sanitizer-coverage-trace-pointee-access-atomic
+
 export CFLAGS_KCOV_DATAFLOW := $(kcov-dataflow-flags-y)
 export CFLAGS_KCOV_DATAFLOW_NO_INLINE := $(kcov-dataflow-noinline-y)
 export RUSTFLAGS_KCOV_DATAFLOW := $(kcov-dataflow-rflags-y)

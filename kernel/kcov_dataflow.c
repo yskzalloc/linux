@@ -457,10 +457,15 @@ kcov_df_hdr(u64 type, u32 nvals, u32 size, u32 arg_idx, u32 seq, bool mem)
  * no fixed-size bit pattern, or an in-memory object the function never uses,
  * whose caller may pass anything (dead argument elimination hands it poison)
  * -- so it is not read.
+ *
+ * @word2 is word [2] of a record that carries its value itself: 0 for
+ * ENTRY/RET, the access kind for an ACCESS record, whose @val is a value the
+ * instrumented code loaded or stored and whose @num_fields is always 0 -- no
+ * ACCESS record ever makes this read memory.
  */
 static noinline notrace __no_sanitize_coverage void
 kcov_df_write(u64 type, u64 pc, u32 arg_idx, u32 size, u64 val,
-	      u64 *offsets, u32 num_fields)
+	      u64 *offsets, u32 num_fields, u64 word2)
 {
 	struct task_struct *t = current;
 	u64 *area;
@@ -501,10 +506,11 @@ kcov_df_write(u64 type, u64 pc, u32 arg_idx, u32 size, u64 val,
 					num_fields != 0);
 	area[start_index + 1] = kcov_df_canonicalize_ip(pc);
 	/*
-	 * Word [2] is the address the field values were read from, and zero for
-	 * a record that carries the value itself: there is no object behind it.
+	 * Word [2] is the address the field values were read from, or, for a
+	 * record that carries the value itself, @word2: zero for ENTRY/RET, as
+	 * there is no object behind it, and the access kind for ACCESS.
 	 */
-	area[start_index + 2] = num_fields ? val : 0;
+	area[start_index + 2] = num_fields ? val : word2;
 
 	if (num_fields == 0) {
 		/*
@@ -589,6 +595,17 @@ out:
  */
 #define KCOV_DF_CALL_SITE(ret_ip)	((ret_ip) - 1)
 
+/*
+ * The arg_idx of a trace-args call the compiler emits for a load or store
+ * through a pointer argument (-sanitizer-coverage-trace-pointee-access):
+ * bit 31 set, the access kind in bits 16..23, the IR argument in bits 0..15.
+ * @val is the loaded or stored value itself and @offsets is NULL: there is
+ * nothing to read, and kcov_df_write() is told so whatever @num_fields says.
+ */
+#define KCOV_DF_ARG_ACCESS		(1U << 31)
+#define KCOV_DF_ARG_ACCESS_KIND(a)	(((a) >> 16) & 0xFF)
+#define KCOV_DF_ARG_INDEX(a)		((a) & 0xFFFF)
+
 #ifdef CONFIG_KCOV_DATAFLOW_ARGS
 noinline void notrace __no_sanitize_coverage
 __sanitizer_cov_trace_args(u32 arg_idx, u32 arg_size, u64 val,
@@ -600,8 +617,13 @@ __sanitizer_cov_trace_args(u32 arg_idx, u32 arg_size, u64 val,
 {
 	unsigned long ua_flags = user_access_save();
 
-	kcov_df_write(KCOV_DF_TYPE_ENTRY, KCOV_DF_CALL_SITE(_RET_IP_), arg_idx,
-		      arg_size, val, offsets, num_fields);
+	if (arg_idx & KCOV_DF_ARG_ACCESS)
+		kcov_df_write(KCOV_DF_TYPE_ACCESS, KCOV_DF_CALL_SITE(_RET_IP_),
+			      KCOV_DF_ARG_INDEX(arg_idx), arg_size, val, NULL, 0,
+			      KCOV_DF_ARG_ACCESS_KIND(arg_idx));
+	else
+		kcov_df_write(KCOV_DF_TYPE_ENTRY, KCOV_DF_CALL_SITE(_RET_IP_),
+			      arg_idx, arg_size, val, offsets, num_fields, 0);
 	user_access_restore(ua_flags);
 }
 EXPORT_SYMBOL(__sanitizer_cov_trace_args);
@@ -619,7 +641,7 @@ __sanitizer_cov_trace_ret(u32 ret_size, u64 val,
 	unsigned long ua_flags = user_access_save();
 
 	kcov_df_write(KCOV_DF_TYPE_RET, KCOV_DF_CALL_SITE(_RET_IP_), 0,
-		      ret_size, val, offsets, num_fields);
+		      ret_size, val, offsets, num_fields, 0);
 	user_access_restore(ua_flags);
 }
 EXPORT_SYMBOL(__sanitizer_cov_trace_ret);

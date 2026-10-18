@@ -167,7 +167,12 @@ int main(void)
 
 			if (nvals < 1 || (type != KCOV_DF_TYPE_ENTRY &&
 					  type != KCOV_DF_TYPE_RET &&
-					  type != KCOV_DF_TYPE_CMP))
+					  type != KCOV_DF_TYPE_CMP &&
+					  type != KCOV_DF_TYPE_ACCESS))
+				break;
+			/* An access value is never read from memory. */
+			if (type == KCOV_DF_TYPE_ACCESS &&
+			    (nvals != 1 || (hdr & KCOV_DF_HDR_MEM)))
 				break;
 			if (type != KCOV_DF_TYPE_CMP)
 				nargs++;

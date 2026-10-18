@@ -42,6 +42,7 @@
  *                    KCOV_DF_MAGIC_BAD
  *         CMP:       comparison type, KCOV_CMP_SIZE()/KCOV_CMP_CONST bits
  *                    (linux/kcov.h)
+ *         ACCESS:    the access kind, KCOV_DF_ACCESS_* below
  *     [3 .. 3 + nvals)     value words: the value itself (nvals == 1), the
  *                          words read at word [2] (KCOV_DF_HDR_MEM), or the
  *                          two CMP operands (nvals == 2)
@@ -70,6 +71,18 @@
  *    8 at a time; size is the number of bytes. For dereferenceable_or_null
  *    the pointer may be NULL.
  *
+ * An ACCESS record (CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS) is the value of a
+ * load or store an instrumented function made through one of its pointer
+ * arguments, recorded after the access, in the middle of the function: word
+ * [3] is the value the load returned or the store wrote, size its bytes,
+ * argidx the pointer argument, word [2] whether it was a load or a store. The
+ * value comes from the compiler; nothing is read for it, KCOV_DF_HDR_MEM is
+ * never set. Where in the pointee the access was is for the record's
+ * __sancov_dataflow descriptor to say; a wider access is several records. An
+ * ACCESS record says what the function did with the pointee when it did it,
+ * not what the pointee held at the call, nor that a stored value stayed.
+ * A decoder that predates ACCESS records skips them by nvals.
+ *
  * Which of the two a record is, and what the bytes are in source terms, is
  * for the __sancov_dataflow descriptor of its pc and the DWARF of the binary to
  * say ("sancov -symbolize-dataflow" cuts a snapshot into the pointee's
@@ -83,9 +96,9 @@
  *   bit  24      KCOV_DF_HDR_MEM: the value words were read at word [2]
  *   bits 28..31  record type, KCOV_DF_TYPE_*
  *   bits 32..47  nvals, the number of value words that follow word [2]
- *   bits 48..55  ENTRY/RET: size in bytes of the traced argument/return value
- *                (clamped to 255)
- *   bits 56..63  ENTRY: argument index (clamped to 255); RET: 0
+ *   bits 48..55  ENTRY/RET/ACCESS: size in bytes of the traced argument/return
+ *                value, or of the accessed value (clamped to 255)
+ *   bits 56..63  ENTRY/ACCESS: argument index (clamped to 255); RET: 0
  *
  * A consumer walks the buffer as
  *
@@ -100,6 +113,7 @@
  * area[0] never exceeds the buffer size minus one, and every counted word has
  * been written, so the walk above stays inside the mapping.
  */
+#define KCOV_DF_TYPE_ACCESS	0xA
 #define KCOV_DF_TYPE_CMP	0xC
 #define KCOV_DF_TYPE_ENTRY	0xE
 #define KCOV_DF_TYPE_RET	0xF
@@ -120,6 +134,16 @@
 #define KCOV_DF_HDR_NVALS(h)	(((h) >> KCOV_DF_HDR_NVALS_SHIFT) & KCOV_DF_HDR_NVALS_MASK)
 #define KCOV_DF_HDR_SIZE(h)	(((h) >> KCOV_DF_HDR_SIZE_SHIFT) & KCOV_DF_HDR_SIZE_MASK)
 #define KCOV_DF_HDR_ARGIDX(h)	(((h) >> KCOV_DF_HDR_ARGIDX_SHIFT) & KCOV_DF_HDR_ARGIDX_MASK)
+
+/*
+ * Word [2] of an ACCESS record: a store if KCOV_DF_ACCESS_STORE, else a load;
+ * volatile, atomic, and for an atomic access its LLVM ordering (2 relaxed,
+ * 4 acquire, 5 release, 6 acq_rel, 7 seq_cst) in bits 4..6.
+ */
+#define KCOV_DF_ACCESS_STORE		0x1ULL
+#define KCOV_DF_ACCESS_VOLATILE		0x2ULL
+#define KCOV_DF_ACCESS_ATOMIC		0x4ULL
+#define KCOV_DF_ACCESS_ORDERING(w)	(((w) >> 4) & 0x7)
 
 /* Words per record: header, pc, address/cmp-type, then the value words. */
 #define KCOV_DF_RECORD_HDR_WORDS	3

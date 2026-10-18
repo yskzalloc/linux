@@ -2297,6 +2297,47 @@ config KCOV_DATAFLOW_POINTEE_BYTES
 	  Each 8 bytes cost a record word. 0 records every pointer by value
 	  only. At most 255, the largest size a record header holds.
 
+config KCOV_DATAFLOW_POINTEE_ACCESS
+	bool "Record the values of loads and stores through pointer arguments"
+	depends on KCOV_DATAFLOW_ARGS
+	depends on $(cc-option,-fsanitize-coverage=trace-args -mllvm -sanitizer-coverage-trace-pointee-access)
+	depends on !RUST || $(rustc-option,-Cllvm-args=-sanitizer-coverage-trace-pointee-access)
+	help
+	  Also record, after each load and store an instrumented function
+	  makes through one of its pointer arguments at a constant offset
+	  (p->field, p[3], container_of(p, ...)->field), the value it loaded
+	  or stored, as a KCOV_DF_TYPE_ACCESS record. The value is the one
+	  the program's own instruction produced: nothing is read for it,
+	  and the access is not moved, duplicated or widened, so KASAN and
+	  KCSAN see exactly the accesses they see without this option.
+
+	  This is how the pointee of a plain C pointer, which has no
+	  dereferenceable contract for KCOV_DATAFLOW_POINTEE_BYTES, is seen:
+	  as far as the function accesses it, when it accesses it. A record
+	  is not a snapshot of the pointee and does not cover the members the
+	  function did not touch; one member may have many records.
+
+	  Each executed access costs a callback and a four-word record.
+
+config KCOV_DATAFLOW_POINTEE_ACCESS_VOLATILE
+	bool "Also record volatile accesses (READ_ONCE/WRITE_ONCE)"
+	depends on KCOV_DATAFLOW_POINTEE_ACCESS
+	help
+	  Record volatile loads and stores through pointer arguments too,
+	  such as READ_ONCE()/WRITE_ONCE(), from the value of the original
+	  access, which stays as it is. MMIO accessors written in inline
+	  assembly are never recorded.
+
+config KCOV_DATAFLOW_POINTEE_ACCESS_ATOMIC
+	bool "Also record atomic loads and stores"
+	depends on KCOV_DATAFLOW_POINTEE_ACCESS
+	help
+	  Record atomic loads and stores the compiler sees as such (C11
+	  __atomic builtins, Rust atomics), from the value of the original
+	  access, with its ordering unchanged. Read-modify-write and
+	  compare-exchange operations, and the kernel's inline-assembly
+	  atomics, are never recorded.
+
 config KCOV_DATAFLOW_NO_INLINE
 	bool "Disable inlining for dataflow-instrumented files"
 	depends on KCOV_DATAFLOW_ARGS || KCOV_DATAFLOW_RET
