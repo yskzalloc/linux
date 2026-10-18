@@ -23,6 +23,15 @@ run_capture() does the work and is also what test_modules.py drives:
 The CLI then prints them as a call tree, or flat with --raw, with kallsyms
 symbol resolution and addr2line source lines (vmlinux / module .ko).
 
+ACCESS records (CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS) are the values of the
+loads and stores a function made through its pointer arguments, made in the
+middle of the call when the access executed. The tree shows each under the
+active frame of its function, in execution order among that frame's calls
+("o->in.x load=0x5"); --accesses=summary folds them into the frame's line
+instead, keeping their order, kind and repeats, and --accesses=none hides
+them. They are never shown as argument values: an access is not what the
+pointee held at the call.
+
 When sancov is found (--sancov, $SANCOV or PATH), every module record is
 also resolved through "sancov -symbolize-dataflow", which joins the
 __sancov_dataflow descriptor and the DWARF the compiler emitted for each call:
@@ -37,7 +46,7 @@ Recorded PCs have the KASLR offset removed (same as mainline kcov), so
 the runtime offset is derived from /proc/kallsyms and System.map / vmlinux
 (or a per-architecture default) and added back for symbolization; use
 --kaslr-offset to override. Records must contain at least one value word
-and one of the three record types, otherwise the parser resyncs word by
+and one of the four record types, otherwise the parser resyncs word by
 word (e.g. after a userspace reset of area[0] mid-run).
 """
 import os
@@ -53,10 +62,17 @@ import subprocess
 import shutil
 
 # Constants -- must match include/uapi/linux/kcov_dataflow.h
+DF_TYPE_ACCESS = 0xA
 DF_TYPE_CMP = 0xC
 DF_TYPE_ENTRY = 0xE
 DF_TYPE_RET = 0xF
 MAGIC_BAD = 0xBADADD85
+# Word 2 of an ACCESS record.
+DF_ACCESS_STORE = 0x1
+DF_ACCESS_VOLATILE = 0x2
+DF_ACCESS_ATOMIC = 0x4
+ATOMIC_ORDERINGS = {1: "unordered", 2: "relaxed", 4: "acquire", 5: "release",
+                    6: "acq_rel", 7: "seq_cst"}
 # 4M words = 32MB. The kernel accepts up to 128MB (KCOV_DF_INIT_TRACK), and a
 # run with CONFIG_KCOV_DATAFLOW_NO_INLINE needs the headroom: preserving every
 # function boundary in an instrumented object turns calls that would have been
@@ -68,7 +84,8 @@ BUF_SIZE = 4194304
 # Record header word: bits 0-23 seq | 24 values read in memory | 28-31 type |
 # 32-47 nvals | 48-55 arg/ret size | 56-63 arg index. Word 1 is the pc (KASLR
 # offset removed, like mainline kcov), word 2 the address the values were read
-# at (ENTRY/RET) or the comparison type (CMP), then nvals value words.
+# at (ENTRY/RET), the comparison type (CMP) or the access kind (ACCESS), then
+# nvals value words.
 def hdr_seq(h):
     return h & 0x00FFFFFF
 
@@ -450,6 +467,8 @@ def parse_records(buf, total_words):
     records = []
     pos = 1
     end = min(1 + total_words, BUF_SIZE)
+    prev_seq = None
+    pending_break = False
     while pos + RECORD_HDR_WORDS <= end:
         hdr = buf[pos]
         rtype = hdr_type(hdr)
@@ -457,10 +476,18 @@ def parse_records(buf, total_words):
 
         # Every record the kernel writes has nvals >= 1 and a known type;
         # anything else is garbage (e.g. a userspace reset mid-run): resync.
-        if rtype not in (DF_TYPE_ENTRY, DF_TYPE_RET, DF_TYPE_CMP) \
+        if rtype not in (DF_TYPE_ENTRY, DF_TYPE_RET, DF_TYPE_CMP,
+                         DF_TYPE_ACCESS) \
                 or num_vals == 0 or pos + RECORD_HDR_WORDS + num_vals > end:
             pos += 1
             continue
+        # The sequence number of a task's records counts up by one, CMP
+        # records included; a jump means another task's records (a remote
+        # kworker's merged block) or a reset, where call frames cannot carry
+        # over.
+        seq = hdr_seq(hdr)
+        ctx_break = prev_seq is not None and seq != (prev_seq + 1) & 0xFFFFFF
+        prev_seq = seq
 
         pc = int(buf[pos + 1]) + KASLR_OFFSET
         # ENTRY/RET: the address the values were read at (header bit 24),
@@ -468,6 +495,7 @@ def parse_records(buf, total_words):
         # type.
         addr = int(buf[pos + 2])
         if rtype == DF_TYPE_CMP:
+            pending_break = pending_break or ctx_break
             pos += RECORD_HDR_WORDS + num_vals
             continue
 
@@ -487,7 +515,9 @@ def parse_records(buf, total_words):
             "size": hdr_size(hdr),
             "val": vals[0],
             "vals": vals,
+            "ctx_break": ctx_break or pending_break,
         })
+        pending_break = False
         pos += RECORD_HDR_WORDS + num_vals
     return records
 
@@ -889,6 +919,91 @@ def format_record(rec, point):
     return text if is_ret else f"{name}={text}"
 
 
+def access_kind(rec):
+    """'load' or 'store' of an ACCESS record, with volatile/atomic marks."""
+    k = rec["addr"]
+    out = "store" if k & DF_ACCESS_STORE else "load"
+    if k & DF_ACCESS_ATOMIC:
+        out = f"{out}.{ATOMIC_ORDERINGS.get((k >> 4) & 7, 'atomic')}"
+    if k & DF_ACCESS_VOLATILE:
+        out = f"{out}.volatile"
+    return out
+
+
+def access_target(rec, point):
+    """
+    [(where, value text)] for an ACCESS record: the members of the pointee
+    the accessed bytes overlap, named by their source expression (o->in.x,
+    "(part)" for some of a member), with their bits of the value, from its
+    sancov @point; without the members, the pointer argument and the byte
+    range of the descriptor (arg0[+8:4]), or, without a descriptor, the
+    argument alone (arg0[?:4]).
+    """
+    obs = (point or {}).get("observation") or {}
+    acc = obs.get("access") or {}
+    src = (point or {}).get("source") or {}
+    members = (src.get("access") or {}).get("members") or []
+    val = rec["val"]
+    if src.get("provenance") in ("exact", "heuristic") and members:
+        guess = "?" if src.get("provenance") == "heuristic" else ""
+        out = []
+        for m in members:
+            bits = m["overlap_bits"]
+            v = _bits(val, m["value_bit_offset"], bits) if bits <= 64 else val
+            if m.get("complete", True):
+                text = decode_member(v, m)
+            else:
+                text = format_val(v)
+            part = "" if m.get("complete", True) else "(part)"
+            out.append((f"{m['expression']}{guess}{part}", text))
+        return out
+    name = (src.get("parameter") or {}).get("name") or f"arg{rec['arg_idx']}"
+    if "offset" in acc:
+        where = f"{name}[{acc['offset']:+d}:{rec['size']}]"
+        if acc.get("access_size", rec["size"]) != rec["size"]:
+            where += f"(piece {acc.get('piece', 0)} of {acc['access_size']})"
+    else:
+        where = f"{name}[?:{rec['size']}]"
+    if src.get("access", {}).get("outside"):
+        where += "(outside " + src["access"].get("object_type", "?") + ")"
+    return [(where, format_val(val))]
+
+
+def format_access(rec, point):
+    """'o->in.x load=0x5' (one per member the access overlaps)."""
+    kind = access_kind(rec)
+    return ", ".join(f"{where} {kind}={text}"
+                     for where, text in access_target(rec, point))
+
+
+def summarize_accesses(events):
+    """
+    The ACCESS records of one call frame, folded per accessed location in
+    the order first accessed: every access stays, in order, with its kind and
+    value, and a run of identical ones is counted, so the first and last
+    values, loads and stores, repeats and which accesses happened at all
+    remain visible: 'o->id: L0x64 S0x65 L0xca S0xcb'.
+    """
+    order, seqs = [], {}
+    for rec, point in events:
+        kind = "S" if rec["addr"] & DF_ACCESS_STORE else "L"
+        for where, text in access_target(rec, point):
+            if where not in seqs:
+                order.append(where)
+                seqs[where] = []
+            run = seqs[where]
+            if run and run[-1][0] == (kind, text):
+                run[-1][1] += 1
+            else:
+                run.append([(kind, text), 1])
+    parts = []
+    for where in order:
+        items = [f"{k}{t}" + (f"x{n}" if n > 1 else "")
+                 for (k, t), n in seqs[where]]
+        parts.append(f"{where}: " + " ".join(items))
+    return "; ".join(parts)
+
+
 def lookup_point(rec, cap, smaps):
     """The sancov point of @rec, or None."""
     if not cap or not smaps:
@@ -930,10 +1045,27 @@ def print_raw(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_ba
     for i, r in enumerate(records):
         name, mod = symbolize(r["pc"], syms)
         sym = f"{name}{mod}"
+        left = f"{locs[i]:>{max_w}s}" if locs[i] else f"{'':>{max_w}s}"
+        if r["type"] == DF_TYPE_ACCESS:
+            # Everything that ties the record to its access: the pointer
+            # argument, kind word, size and value from the record; offset,
+            # piece and whole access size from the descriptor.
+            point = lookup_point(r, cap, smaps)
+            acc = ((point or {}).get("observation") or {}).get("access")
+            desc = ""
+            if acc:
+                desc = (f" [offset={acc['offset']:+d} piece={acc['piece']}"
+                        f" access_size={acc['access_size']}]")
+            src = "  <- " + format_access(r, point) if point else ""
+            brk = " (new context)" if r.get("ctx_break") else ""
+            print(f"{left}   [ACCESS] seq={r['seq']:3d} {sym} "
+                  f"arg[{r['arg_idx']}]({r['size']}) {access_kind(r)} "
+                  f"kind=0x{r['addr']:x} = {format_val(r['val'])}{desc}"
+                  f"{src}{brk}")
+            continue
         is_ret = r["type"] == DF_TYPE_RET
         t = "RET  " if is_ret else "ENTRY"
         size = r["size"]
-        left = f"{locs[i]:>{max_w}s}" if locs[i] else f"{'':>{max_w}s}"
         vals = format_val(r["val"]) if len(r["vals"]) == 1 else \
             "{" + ", ".join(format_val(v) for v in r["vals"]) + "}"
         # Only values read in memory (byval, sret, the bytes behind a
@@ -974,11 +1106,22 @@ def frame_key(pc, syms):
 
 
 def print_tree(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_base=0,
-               cap=None, smaps=None):
+               cap=None, smaps=None, accesses="events"):
     """
     Print records as indented call tree with source line on left. With
     @smaps (see load_source_maps()), every value is named after the source
     parameter and members it holds; see format_record().
+
+    A call is printed when it returns, as "ret = name(args)", below what
+    happened during it, indented one level deeper: its callees, and, with
+    @accesses "events", each of its ACCESS records as "| o->x load=0x5" at
+    the source line of the access, in execution order. An ACCESS record
+    belongs to the innermost active call of the function its call site is in
+    (a recursive call's own accesses go to the recursive call); calls above
+    that one have ended without a return record. One with no active call of
+    its function -- its ENTRY records were not recorded -- is printed as
+    such, never as an argument. "summary" folds a call's accesses into its
+    line instead (see summarize_accesses()); "none" leaves them out.
     """
     if cache is None:
         cache = {}
@@ -988,24 +1131,75 @@ def print_tree(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_b
     max_w = max((len(v) for v in cache.values() if v), default=10)
     max_w = max(max_w, 10)
 
-    depth = 0
-    call_stack = []  # (name, mod, args_str, frame key, pc of first record)
+    def left_of(pc):
+        loc = resolve_line(pc, vmlinux, cache, ko_path, mod_text_base)
+        return f"{loc:>{max_w}s}" if loc else f"{'':>{max_w}s}"
+
+    # Active calls, outermost first: name, mod, args text, frame key, pc of
+    # the first ENTRY record, and the ACCESS records kept for a summary.
+    call_stack = []
+
+    def summary_of(frame):
+        if accesses != "summary" or not frame["events"]:
+            return ""
+        return "  {" + summarize_accesses(frame["events"]) + "}"
+
+    def pop_unreturned():
+        """Close the innermost call, which ended without a return record."""
+        frame = call_stack.pop()
+        indent = "  " * len(call_stack)
+        print(f"{left_of(frame['pc'])}   {indent}{frame['name']}"
+              f"({frame['args']}){frame['mod']}{summary_of(frame)}")
+
     i = 0
     while i < len(records):
         r = records[i]
         name, mod = symbolize(r["pc"], syms)
         key = frame_key(r["pc"], syms)
 
-        if r["type"] == DF_TYPE_ENTRY:
+        if r.get("ctx_break") and call_stack:
+            # Another task's records, or a reset: no frame carries over.
+            while call_stack:
+                pop_unreturned()
+            print(f"{'':>{max_w}s}   # new context (sequence number jump)")
+
+        if r["type"] == DF_TYPE_ACCESS:
+            if accesses == "none":
+                i += 1
+                continue
+            point = lookup_point(r, cap, smaps)
+            at = next((k for k in range(len(call_stack) - 1, -1, -1)
+                       if call_stack[k]["key"] == key), None)
+            if at is None:
+                indent = "  " * len(call_stack)
+                print(f"{left_of(r['pc'])}   {indent}| {name}{mod}: "
+                      f"{format_access(r, point)} (no call record)")
+            else:
+                while len(call_stack) > at + 1:
+                    pop_unreturned()
+                if accesses == "summary":
+                    call_stack[at]["events"].append((r, point))
+                else:
+                    indent = "  " * len(call_stack)
+                    print(f"{left_of(r['pc'])}   {indent}| "
+                          f"{format_access(r, point)}")
+            i += 1
+        elif r["type"] == DF_TYPE_ENTRY:
             # Collect all args for this call: consecutive ENTRY records landing
             # in the same function. The index is the IR argument: a struct the
             # ABI splits into several arguments takes several indexes, and one
             # passed as a first-class aggregate contributes a record per
-            # element under the same index, so an index can repeat.
+            # element under the same index, so an index can repeat. The calls
+            # are made in order at the top of the function, so a record at a
+            # pc not above the last one starts another call of the function:
+            # a recursive call made before anything else was recorded.
             args = []
-            first_pc = r["pc"]
+            first_pc = last_pc = r["pc"]
             while i < len(records) and records[i]["type"] == DF_TYPE_ENTRY \
-                    and frame_key(records[i]["pc"], syms) == key:
+                    and frame_key(records[i]["pc"], syms) == key \
+                    and (not args or (records[i]["pc"] > last_pc
+                                      and not records[i].get("ctx_break"))):
+                last_pc = records[i]["pc"]
                 point = lookup_point(records[i], cap, smaps)
                 vals = records[i]["vals"]
                 if point:
@@ -1019,22 +1213,14 @@ def print_tree(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_b
                                  format_val(records[i]["val"])))
                 i += 1
             args_str = ", ".join(a for _, a in sorted(args, key=lambda x: x[0]))
-            call_stack.append((name, mod, args_str, key, first_pc))
-            depth += 1
+            call_stack.append({"name": name, "mod": mod, "args": args_str,
+                               "key": key, "pc": first_pc, "events": []})
         else:
             # Pop void calls (no return record) until we find the matching frame
-            while call_stack and call_stack[-1][3] != key:
-                depth = max(0, depth - 1)
-                indent = "  " * depth
-                vname, vmod, vargs, _, vpc = call_stack.pop()
-                loc = resolve_line(vpc, vmlinux, cache, ko_path, mod_text_base)
-                left = f"{loc:>{max_w}s}" if loc else f"{'':>{max_w}s}"
-                print(f"{left}   {indent}{vname}({vargs}){vmod}")
-            depth = max(0, depth - 1)
-            indent = "  " * depth
+            if any(fr["key"] == key for fr in call_stack):
+                while call_stack and call_stack[-1]["key"] != key:
+                    pop_unreturned()
             ret_size = r["size"]
-            loc = resolve_line(r["pc"], vmlinux, cache, ko_path, mod_text_base)
-            left = f"{loc:>{max_w}s}" if loc else f"{'':>{max_w}s}"
             # A struct returned by value is reported like a struct argument:
             # one value word per field, with word [2] holding the address they
             # were read from. Render it as {f0, f1, ...} rather than as
@@ -1047,29 +1233,22 @@ def print_tree(records, syms, vmlinux=None, cache=None, ko_path=None, mod_text_b
                     "{" + ", ".join(format_val(v) for v in r["vals"]) + "}"
             if r["mem"] and not is_snapshot(point):
                 ret_val += f" @0x{r['addr']:x}"
-            if call_stack:
-                cname, cmod, cargs, _, cpc = call_stack.pop()
-                loc = resolve_line(cpc, vmlinux, cache, ko_path, mod_text_base)
-                left = f"{loc:>{max_w}s}" if loc else f"{'':>{max_w}s}"
-                if ret_size == 0:
-                    print(f"{left}   {indent}{cname}({cargs}){cmod}")
-                else:
-                    print(f"{left}   {indent}{ret_val} = {cname}({cargs}){cmod}")
+            if call_stack and call_stack[-1]["key"] == key:
+                frame = call_stack.pop()
+                indent = "  " * len(call_stack)
+                head = "" if ret_size == 0 else f"{ret_val} = "
+                print(f"{left_of(frame['pc'])}   {indent}{head}{frame['name']}"
+                      f"({frame['args']}){frame['mod']}{summary_of(frame)}")
             else:
-                if ret_size == 0:
-                    print(f"{left}   {indent}{name}(){mod}")
-                else:
-                    print(f"{left}   {indent}{ret_val} = {name}(){mod}")
+                # A return whose call was not recorded.
+                indent = "  " * len(call_stack)
+                head = "" if ret_size == 0 else f"{ret_val} = "
+                print(f"{left_of(r['pc'])}   {indent}{head}{name}(){mod}")
             i += 1
 
     # Flush remaining void calls on the stack
     while call_stack:
-        depth = max(0, depth - 1)
-        indent = "  " * depth
-        vname, vmod, vargs, _, vpc = call_stack.pop()
-        loc = resolve_line(vpc, vmlinux, cache, ko_path, mod_text_base)
-        left = f"{loc:>{max_w}s}" if loc else f"{'':>{max_w}s}"
-        print(f"{left}   {indent}{vname}({vargs}){vmod}")
+        pop_unreturned()
 
 
 def main():
@@ -1094,6 +1273,11 @@ def main():
                              "resolves all of vmlinux)")
     parser.add_argument("--sancov", help="sancov binary (default: $SANCOV, "
                         "then PATH)")
+    parser.add_argument("--accesses", choices=("events", "summary", "none"),
+                        default="events",
+                        help="ACCESS records in the tree: each in execution "
+                             "order under its call (default), folded into "
+                             "the call's line, or not shown")
     args = parser.parse_args()
 
     ko_path = args.ko or find_module(args.module)
@@ -1141,8 +1325,12 @@ def main():
             print("# no sancov ($SANCOV, --sancov or PATH): values are shown "
                   "by IR argument, without parameter or member names",
                   file=sys.stderr)
-    show = print_raw if args.raw else print_tree
-    show(records, cap.syms, vmlinux, {}, ko_path, cap.mod_text_start, cap, smaps)
+    if args.raw:
+        print_raw(records, cap.syms, vmlinux, {}, ko_path, cap.mod_text_start,
+                  cap, smaps)
+    else:
+        print_tree(records, cap.syms, vmlinux, {}, ko_path, cap.mod_text_start,
+                   cap, smaps, accesses=args.accesses)
 
     print_kernel_meta(meta, ko_path=ko_path)
 
