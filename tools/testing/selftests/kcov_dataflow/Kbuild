@@ -6,5 +6,6 @@
 # KCOV_DATAFLOW_<object>.o := y, the same per-file switch in-tree code uses.
 obj-m				+= rust_ffi_contract/
 obj-m				+= eight_struct_args_c/
+obj-m				+= pointee_access_c/
 obj-$(CONFIG_RUST)		+= eight_struct_args_rust/
 obj-$(CONFIG_RUST)		+= rust_kworker_remote/

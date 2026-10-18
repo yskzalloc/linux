@@ -22,7 +22,7 @@ CFLAGS += -Wall -O2 $(KHDR_INCLUDES)
 
 # The .ko files kbuild produces for KDIR's configuration, so that they are
 # built by "all" and copied by "install"; the Rust modules need CONFIG_RUST.
-KMODS := rust_ffi_contract eight_struct_args_c
+KMODS := rust_ffi_contract eight_struct_args_c pointee_access_c
 ifneq ($(shell grep -s ^CONFIG_RUST=y $(KDIR)/.config),)
 KMODS += eight_struct_args_rust rust_kworker_remote
 endif
