@@ -16,8 +16,8 @@ user_ioctl/
     ioctl interface test (kselftest harness, TAP).
 binderfs/
     binder ioctls under recording (TAP).
-rust_ffi_contract/, eight_struct_args_c/, eight_struct_args_rust/,
-rust_kworker_remote/
+rust_ffi_contract/, eight_struct_args_c/, pointee_access_c/,
+eight_struct_args_rust/, rust_kworker_remote/
     test modules; each README.rst says what the module exercises.
 test_modules.py
     KTAP runner: loads every module, triggers it with recording active and
@@ -27,7 +27,11 @@ test_modules.py
     ``--sancov`` or ``PATH``) it also resolves every record through the
     module's ``__sancov_dataflow`` descriptors and DWARF and checks the
     source parameters, struct members, pointee layouts and which pointee
-    members a snapshot holds.
+    members a snapshot holds. With access records compiled in
+    (``CONFIG_KCOV_DATAFLOW_POINTEE_ACCESS``, read from each module's
+    descriptors), it checks the values the modules' functions loaded and
+    stored through their pointer arguments, per call and in order, and the
+    members they name; without, that there are none.
     Modules that are not built are SKIPped.
 trigger-view.py
     Interactive viewer the runner is built on (call tree or ``--raw``
@@ -37,7 +41,10 @@ trigger-view.py
     the bytes recorded behind it where the compiler's IR said they may be
     read (``-> T {.m=v, ...}``), else its layout alone (``(not read)``);
     ``--dwarf`` extends that to vmlinux records, ``--no-dwarf`` turns it
-    off.
+    off. ACCESS records show under the call they were made in, at the line
+    of the access, as ``| o->in.x load=0x5`` (``--accesses=summary`` folds
+    them into the call's line, ``--accesses=none`` hides them); ``--raw``
+    adds the descriptor's offset, piece and access size.
 
 Kernel
 ------

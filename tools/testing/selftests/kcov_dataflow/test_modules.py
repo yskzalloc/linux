@@ -50,8 +50,15 @@ tv = _load_trigger_view()
 class Check:
     """Collects expectation failures for one module."""
 
-    def __init__(self):
+    def __init__(self, access=None):
         self.failures = []
+        # The access kinds the module was compiled to record (see
+        # ko_access_kinds()), empty without access records.
+        self.access = access or set()
+
+    @property
+    def access_volatile(self):
+        return any(k & ACCESS_VOLATILE for k in self.access)
 
     def eq(self, what, got, want):
         if got != want:
@@ -72,6 +79,97 @@ def fmt(v):
 
 def entries(cap, recs, func):
     return [r for r in recs if r["type"] == tv.DF_TYPE_ENTRY and func in cap.funcs(r)]
+
+
+def access_recs(cap, recs, func):
+    """The ACCESS records of @func, in execution order."""
+    return [r for r in recs if r["type"] == tv.DF_TYPE_ACCESS and func in cap.funcs(r)]
+
+
+def ko_access_kinds(ko):
+    """
+    The access kinds the __sancov_dataflow descriptors of module @ko have
+    (version 2 descriptors, see SanitizerCoverage.cpp): the empty set for a
+    module built without -sanitizer-coverage-trace-pointee-access, None if it
+    has no descriptors to tell. Read from the ELF file itself, so that the
+    expectations follow what the module was compiled with, sancov or not.
+    """
+    import struct as st
+    try:
+        with open(ko, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        return None     # 64-bit little-endian only
+    shoff, = st.unpack_from("<Q", data, 0x28)
+    shentsize, shnum, shstrndx = st.unpack_from("<HHH", data, 0x3a)
+    secs = [st.unpack_from("<IIQQQQIIQQ", data, shoff + i * shentsize)
+            for i in range(shnum)]
+    strtab = secs[shstrndx]
+    for name, _, _, _, off, size, *_ in secs:
+        end = data.index(b"\0", strtab[4] + name)
+        if data[strtab[4] + name:end] != b"__sancov_dataflow":
+            continue
+        body = data[off:off + size]
+        for pc in (4, 8):
+            stride = pc + 20
+            if size % stride or any(body[o + pc] not in (1, 2)
+                                    for o in range(0, size, stride)):
+                continue
+            return {body[o + pc + 3] for o in range(0, size, stride)
+                    if body[o + pc] == 2}
+        return None
+    return None
+
+
+ACCESS_VOLATILE = 0x2
+ACCESS_ATOMIC = 0x4
+
+
+def check_access_records(c, name, recs):
+    """Every ACCESS record carries its value itself: nothing was read."""
+    for r in recs:
+        if r["type"] != tv.DF_TYPE_ACCESS:
+            continue
+        c.true(f"{name}: ACCESS record at 0x{r['pc']:x} is a value "
+               f"(nvals {len(r['vals'])}, mem {r['mem']})",
+               len(r["vals"]) == 1 and not r["mem"])
+        c.true(f"{name}: ACCESS record at 0x{r['pc']:x}: kind word "
+               f"0x{r['addr']:x} has no unknown bits", not r["addr"] & ~0x77)
+        c.true(f"{name}: ACCESS record at 0x{r['pc']:x}: size {r['size']}",
+               1 <= r["size"] <= 8)
+
+
+def accesses(recs):
+    """[(kind, size, value)] of ACCESS records, kind 'L' or 'S'."""
+    return [("S" if r["addr"] & tv.DF_ACCESS_STORE else "L", r["size"], r["val"])
+            for r in recs]
+
+
+def frames_of(cap, recs, func):
+    """
+    The calls of @func in @recs, each the list of its own ACCESS records, as
+    trigger-view.py attributes them: to the innermost active call of the
+    function. A call starts with its ENTRY records (a pc not above the last
+    one starts another call), ends with its RET record.
+    """
+    stack, done, last_pc = [], [], None
+    for r in recs:
+        if func not in cap.funcs(r):
+            last_pc = None
+            continue
+        if r["type"] == tv.DF_TYPE_ENTRY:
+            if last_pc is None or r["pc"] <= last_pc:
+                stack.append([])
+            last_pc = r["pc"]
+            continue
+        last_pc = None
+        if r["type"] == tv.DF_TYPE_ACCESS and stack:
+            stack[-1].append(r)
+        elif r["type"] == tv.DF_TYPE_RET and stack:
+            done.append(stack.pop())
+    return done + stack[::-1]
 
 
 def ret_recs(cap, recs, func):
@@ -142,6 +240,23 @@ def check_struct_family(cap, recs, c, p, flat_ns, stpf8_runs):
         got = rets(cap, recs, f"{p}sf_{n}")
         c.true(f"{p}sf_{n} RET values all {fmt(flat_sum(n))}: {fmt(got)}",
                bool(got) and all(v == flat_sum(n) for v in got))
+
+    # With access records, sf_N's own loads of a->a, b->b, ..., one member of
+    # each object, 0x11 * (k + 1) through argument k: the values the function
+    # added up, not snapshots of the objects.
+    if c.access:
+        for n in flat_ns:
+            got = sorted((r["arg_idx"], r["size"], r["val"])
+                         for r in access_recs(cap, recs, f"{p}sf_{n}"))
+            want = sorted((k, 8, 0x11 * (k + 1)) for k in range(n))
+            if p and n == 1:
+                c.true(f"{p}sf_1 ACCESS loads include {fmt([w[2] for w in want])}",
+                       all(w in got for w in want))
+            else:
+                c.eq(f"{p}sf_{n} ACCESS loads (arg, size, value)", got, want)
+    else:
+        c.eq(f"{p}sf_N: no ACCESS records without access instrumentation",
+             [r for r in recs if r["type"] == tv.DF_TYPE_ACCESS], [])
 
     for fam, calls in ((f"{p}stf", 1), (f"{p}stpf", stpf8_runs)):
         for n in range(1, 9):
@@ -263,6 +378,112 @@ def check_eight_struct_args_rust(cap, recs, c):
     check_struct_family(cap, recs, c, "r", (1, 2, 4, 8), stpf8_runs=1)
 
 
+def check_pointee_access_c(cap, recs, c):
+    """
+    The values pointee_access_c's functions load and store through their
+    plain C pointer arguments, as ACCESS records, in execution order: see
+    the comments there. No pointer argument comes with a snapshot -- C gives
+    none of them a dereferenceable contract -- so the accesses are all there
+    is of the pointees.
+    """
+    if not c.access:
+        c.eq("pointee_access_c: no ACCESS records without access "
+             "instrumentation", [r for r in recs if r["type"] == tv.DF_TYPE_ACCESS], [])
+        return
+    for f in ("pa_get", "pa_set_tag", "pa_maybe", "pa_bump", "pa_locked",
+              "pa_key", "pa_bits", "pa_indirect", "pa_copy"):
+        for r in entries(cap, recs, f):
+            c.true(f"{f} arg[{r['arg_idx']}]: by value, no inferred snapshot",
+                   not r["mem"] and len(r["vals"]) == 1)
+
+    # Two independent loads, in whichever order the compiler made them.
+    c.eq("pa_get ACCESS (x, y)", sorted(accesses(access_recs(cap, recs, "pa_get"))),
+         sorted([("L", 4, 5), ("L", 2, 6)]))
+    c.eq("pa_set_tag ACCESS (tag[2] = 42)",
+         accesses(access_recs(cap, recs, "pa_set_tag")), [("S", 1, 42)])
+    # Called with 0, then 1: one call loaded, the other did not.
+    calls = frames_of(cap, recs, "pa_maybe")
+    c.eq("pa_maybe calls", len(calls), 2)
+    c.eq("pa_maybe ACCESS per call (c = 0, then c = 1)",
+         [accesses(fr) for fr in calls], [[], [("L", 8, 100)]])
+    # The same member around an opaque call that changes it, in order.
+    seq = [(sorted(cap.funcs(r))[0], k, v) for r, (k, _, v) in
+           ((r, accesses([r])[0]) for r in recs if r["type"] == tv.DF_TYPE_ACCESS
+            and cap.funcs(r) & {"pa_bump", "pa_twice"})]
+    c.eq("pa_bump/pa_twice ACCESS sequence", seq,
+         [("pa_bump", "L", 100), ("pa_bump", "S", 101),
+          ("pa_twice", "L", 101), ("pa_twice", "S", 202),
+          ("pa_bump", "L", 202), ("pa_bump", "S", 203)])
+    c.eq("pa_locked ACCESS (x under the lock)",
+         accesses(access_recs(cap, recs, "pa_locked")), [("L", 4, 5)])
+    c.eq("pa_key ACCESS (container_of key)",
+         accesses(access_recs(cap, recs, "pa_key")), [("L", 8, 0x4b4559)])
+    # READ_ONCE()/WRITE_ONCE() only with volatile accesses recorded; the
+    # inline-assembly atomic_inc() never.
+    got = access_recs(cap, recs, "pa_once")
+    if c.access_volatile:
+        c.eq("pa_once ACCESS (READ_ONCE id, WRITE_ONCE y)", accesses(got),
+             [("L", 8, 203), ("S", 2, 0x77)])
+        c.true("pa_once ACCESS are volatile",
+               all(r["addr"] & tv.DF_ACCESS_VOLATILE for r in got))
+    else:
+        c.eq("pa_once ACCESS (volatile not recorded)", accesses(got), [])
+    # flag = 5, mode = 17 share a byte: 5 | 17 << 3.
+    got = accesses(access_recs(cap, recs, "pa_bits"))
+    c.true(f"pa_bits ACCESS loads of the bit-field byte 0x8d: {got}",
+           bool(got) and all(k == "L" and v & 0xff == 0x8d for k, _, v in got))
+    c.eq("pa_wide ACCESS (two pieces of the 16-byte value)",
+         accesses(access_recs(cap, recs, "pa_wide")),
+         [("L", 8, 0x99aabbccddeeff00), ("L", 8, 0x1122334455667788)])
+    # pa_depth(s, 2): each level's own load, the innermost one of s->id.
+    calls = frames_of(cap, recs, "pa_depth")
+    c.eq("pa_depth ACCESS per call, innermost first",
+         [accesses(fr) for fr in calls],
+         [[("L", 8, 203)], [("L", 4, 5)], [("L", 4, 5)]])
+    # h->state is loaded through h; ->id through the loaded pointer is not
+    # followed.
+    got = access_recs(cap, recs, "pa_indirect")
+    c.eq("pa_indirect ACCESS (only h->state)", [(k, s) for k, s, _ in accesses(got)],
+         [("L", 8)])
+    c.eq("pa_copy ACCESS (memcpy: none)", accesses(access_recs(cap, recs, "pa_copy")),
+         [])
+
+
+def dwarf_pointee_access_c(cap, recs, c, dw):
+    """Each access names the member it accessed, from the DWARF."""
+    if not c.access:
+        return
+
+    def exprs(func):
+        out = []
+        for r in access_recs(cap, recs, func):
+            src = (dw.point(r) or {}).get("source") or {}
+            acc = src.get("access") or {}
+            out.append((tuple(m["expression"] for m in acc.get("members", [])),
+                        bool(acc.get("outside"))))
+        return out
+
+    c.eq("DWARF: pa_get accesses", sorted(exprs("pa_get")),
+         [(("s->in.x",), False), (("s->in.y",), False)])
+    c.eq("DWARF: pa_set_tag access", exprs("pa_set_tag"), [(("s->tag[2]",), False)])
+    c.eq("DWARF: pa_key access (before struct list_head)", exprs("pa_key"),
+         [((), True)])
+    for r in access_recs(cap, recs, "pa_key"):
+        obs = (dw.point(r) or {}).get("observation") or {}
+        c.eq("DWARF: pa_key access offset", (obs.get("access") or {}).get("offset"),
+             -8)
+    for r in access_recs(cap, recs, "pa_bits"):
+        src = (dw.point(r) or {}).get("source") or {}
+        got = {m["name"]: tv._bits(r["val"], m["value_bit_offset"], m["overlap_bits"])
+               for m in (src.get("access") or {}).get("members", [])
+               if m.get("complete", True)}
+        c.eq("DWARF: pa_bits members decoded", {k: got.get(k) for k in ("flag", "mode")},
+             {"flag": 5, "mode": 17})
+    c.eq("DWARF: pa_indirect access", exprs("pa_indirect"), [(("h->state",), False)])
+    got = [m for e, _ in exprs("pa_wide") for m in e]
+    c.eq("DWARF: pa_wide accesses (two parts of *p)", got, ["*p", "*p"])
+
+
 def check_rust_ffi_contract(cap, recs, c):
     """
     ffi_alloc_buf(&alloc = {NULL, 0, 0, 0}, 256, 16, is_async=1) records
@@ -304,6 +525,19 @@ def check_rust_ffi_contract(cap, recs, c):
     got = rets(cap, recs, "ffi_check_result")
     c.true(f"ffi_check_result RET -EFAULT: {fmt(got)}",
            len(got) == 1 and got[0] & 0xffffffff == 0xfffffff2)
+
+    # With access records, the violation is in what the functions did with
+    # *alloc: ffi_alloc_buf() loaded free_async == 0, stored buffer = NULL
+    # and data_size = 272, and returned 0; ffi_check_result()'s own load of
+    # alloc->buffer, next to its entry snapshot, is that NULL, seen when the
+    # function tested it.
+    if c.access:
+        got = accesses(access_recs(cap, recs, "ffi_alloc_buf"))
+        c.eq("ffi_alloc_buf ACCESS (load free_async, then the stores)",
+             got[:1] + sorted(got[1:]),
+             [("L", 4, 0), ("S", 8, 0), ("S", 8, 256 + 16)])
+        c.eq("ffi_check_result ACCESS (alloc->buffer, NULL)",
+             accesses(access_recs(cap, recs, "ffi_check_result")), [("L", 8, 0)])
 
 
 def check_rust_kworker_remote(cap, recs, c):
@@ -375,21 +609,30 @@ class Dwarf:
 def check_dwarf_records(cap, recs, c, dw):
     """Every module record agrees with the descriptor and DWARF of its call."""
     stats = {"records": 0, "exact": 0, "positional": 0, "objects": 0,
-             "pointees": 0, "snapshots": 0}
+             "pointees": 0, "snapshots": 0, "accesses": 0}
     for r in recs:
         stats["records"] += 1
         p = dw.point(r)
         name = "/".join(sorted(cap.funcs(r))) or f"0x{r['pc']:x}"
         what = f"{name} {'RET' if r['type'] == tv.DF_TYPE_RET else 'arg[%d]' % r['arg_idx']}"
+        if r["type"] == tv.DF_TYPE_ACCESS:
+            what += " access"
         if not p:
             c.true(f"DWARF: {what}: no sancov point for its pc", False)
             continue
-        kind = "ret" if r["type"] == tv.DF_TYPE_RET else "args"
+        kind = {tv.DF_TYPE_RET: "ret", tv.DF_TYPE_ACCESS: "access"}.get(
+            r["type"], "args")
         c.eq(f"DWARF: {what}: call site kind", p["kind"], kind)
         obs = p.get("observation") or {}
-        if kind == "args":
+        if kind != "ret":
             c.eq(f"DWARF: {what}: descriptor IR argument", obs.get("ir_arg"),
                  r["arg_idx"])
+        if kind == "access":
+            stats["accesses"] += 1
+            acc = obs.get("access") or {}
+            c.eq(f"DWARF: {what}: descriptor access kind",
+                 acc.get("kind"), "store" if r["addr"] & tv.DF_ACCESS_STORE
+                 else "load")
         # A record of values read in memory read an object, or the bytes
         # behind a pointer the IR says are dereferenceable; the descriptor
         # must say the call reports one of those, and which.
@@ -558,6 +801,7 @@ TESTS = (
     ("rust_ffi_contract", False, check_rust_ffi_contract, dwarf_rust_ffi_contract),
     ("eight_struct_args_c", False, check_eight_struct_args_c,
      dwarf_eight_struct_args_c),
+    ("pointee_access_c", False, check_pointee_access_c, dwarf_pointee_access_c),
     ("eight_struct_args_rust", False, check_eight_struct_args_rust,
      dwarf_eight_struct_args_rust),
     ("rust_kworker_remote", True, check_rust_kworker_remote,
@@ -600,8 +844,9 @@ def main():
     vmlinux = tv.find_vmlinux(args.vmlinux)
     sancov = tv.find_sancov(args.sancov)
     if not sancov:
-        ksft.print_msg("DWARF checks skipped: no sancov ($SANCOV, --sancov "
-                       "or PATH)")
+        ksft.print_msg("DWARF checks skipped: no sancov that resolves "
+                       "__sancov_dataflow descriptors ($SANCOV, --sancov or "
+                       "PATH)")
     for name, remote, check, dwarf_check in tests:
         if skip_all:
             ksft.test_result_skip(f"{name}: {skip_all}")
@@ -628,7 +873,17 @@ def main():
             ksft.print_msg(f"{name}: WARNING: capture buffer full at "
                            f"{tv.BUF_SIZE} words; the end of the run was "
                            f"dropped, so later records are missing")
-        c = Check()
+        # What the module was compiled to record decides what is expected of
+        # it; without descriptors, what was recorded.
+        kinds = ko_access_kinds(ko)
+        if kinds is None:
+            kinds = {r["addr"] for r in recs if r["type"] == tv.DF_TYPE_ACCESS}
+        c = Check(kinds)
+        check_access_records(c, name, recs)
+        n_access = sum(r["type"] == tv.DF_TYPE_ACCESS for r in recs)
+        ksft.print_msg(f"{name}: access records "
+                       f"{'compiled in' if kinds else 'not compiled in'}, "
+                       f"{n_access} recorded")
         smap = None
         if sancov:
             try:
@@ -648,7 +903,8 @@ def main():
                            f"{st['objects']} objects read by member, "
                            f"{st['pointees']} pointers with a pointee "
                            f"layout, {st['snapshots']} of them with the "
-                           f"bytes behind them recorded")
+                           f"bytes behind them recorded, {st['accesses']} "
+                           f"access records")
             if dwarf_check:
                 dwarf_check(cap, recs, c, dw)
         for f in c.failures:
